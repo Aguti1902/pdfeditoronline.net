@@ -14,10 +14,41 @@ const SENTRY_ORG = process.env.SENTRY_ORG;
 const SENTRY_PROJECT = process.env.SENTRY_PROJECT;
 const sentryPluginEnabled = !!(SENTRY_AUTH_TOKEN && SENTRY_ORG && SENTRY_PROJECT);
 
+// The Express server replaces these at request time. Baking them into the
+// built HTML lets a static host (Vercel) serve a real page without that server.
+function brandHtmlPlugin() {
+  const brandName = "PDF Editor Online";
+  const brandDomain = "pdfeditoronline.net";
+  return {
+    name: "brand-html",
+    transformIndexHtml(html: string) {
+      return html
+        .replaceAll("%%BRAND_NAME%%", brandName)
+        .replaceAll("%%BRAND_DOMAIN%%", brandDomain)
+        .replaceAll(
+          "%%FAVICON_LINKS%%",
+          `<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3" />\n    <link rel="apple-touch-icon" href="/favicon.svg?v=3" />`,
+        )
+        .replaceAll("%%TRACKING_SCRIPTS%%", "")
+        .replaceAll("%%PAGE_TITLE%%", `Editar PDF en el navegador – firmar y convertir | ${brandName}`)
+        .replaceAll(
+          "%%PAGE_DESCRIPTION%%",
+          "Abre el PDF en el navegador, corrige el texto, firma, convierte a Word o Excel y descarga la copia.",
+        )
+        .replaceAll(
+          "%%PAGE_KEYWORDS%%",
+          "editar PDF en el navegador, firmar PDF, PDF a Word, unir PDF, comprimir PDF",
+        )
+        .replace(/%%[A-Z_]+%%/g, "");
+    },
+  };
+}
+
 const plugins = [
   react(),
   tailwindcss(),
   jsxLocPlugin(),
+  brandHtmlPlugin(),
   // Plugin must be added LAST so it sees the final emitted assets.
   // When disabled (no env vars) it's not added at all so Vite doesn't
   // even import the Sentry CLI binary.
