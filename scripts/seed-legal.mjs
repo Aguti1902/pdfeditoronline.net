@@ -2,11 +2,15 @@
  * Políticas en español para pdfeditoronline.net
  * Run with: node scripts/seed-legal.mjs
  */
-import mysql from "mysql2/promise";
+import pg from "pg";
 import dotenv from "dotenv";
 dotenv.config();
 
-const db = await mysql.createConnection(process.env.DATABASE_URL);
+const db = new pg.Client({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+await db.connect();
 
 const OWNER = `**Alejandro Gutiérrez**, con DNI 48063365N y domicilio en Avinguda Porta Diagonal, Barcelona (España)`;
 const SITE = "pdfeditoronline.net";
@@ -391,16 +395,16 @@ const pages = [
 
 try {
   for (const page of pages) {
-    const [rows] = await db.execute("SELECT id FROM legal_pages WHERE slug = ?", [page.slug]);
-    if (rows.length > 0) {
-      await db.execute(
-        "UPDATE legal_pages SET title = ?, content = ?, updatedAt = NOW() WHERE slug = ?",
+    const found = await db.query('SELECT id FROM legal_pages WHERE slug = $1', [page.slug]);
+    if (found.rows.length > 0) {
+      await db.query(
+        'UPDATE legal_pages SET title = $1, content = $2, "updatedAt" = NOW() WHERE slug = $3',
         [page.title, page.content, page.slug]
       );
       console.log(`Updated: ${page.slug}`);
     } else {
-      await db.execute(
-        "INSERT INTO legal_pages (slug, title, content) VALUES (?, ?, ?)",
+      await db.query(
+        'INSERT INTO legal_pages (slug, title, content) VALUES ($1, $2, $3)',
         [page.slug, page.title, page.content]
       );
       console.log(`Inserted: ${page.slug}`);

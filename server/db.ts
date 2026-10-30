@@ -1,5 +1,6 @@
 import { and, desc, eq, gte, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/mysql2";
+import { drizzle } from "drizzle-orm/node-postgres";
+import pg from "pg";
 import {
   InsertUser,
   InsertBlogPost,
@@ -21,18 +22,34 @@ import {
   webhookEvents,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
-import { dbConnectionConfig } from "./_core/dbConfig";
 import { DUNNING_LOCK_STALE_MS } from "./_core/dunning";
 import { clampTrialHours, trialEndFrom } from "../shared/trial";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
+function queryRows(result: unknown): any[] {
+  if (Array.isArray(result)) {
+    const first = result[0];
+    return Array.isArray(first) ? first : result;
+  }
+  if (result && typeof result === "object" && "rows" in result) {
+    const rows = (result as { rows?: unknown }).rows;
+    return Array.isArray(rows) ? rows : [];
+  }
+  return [];
+}
+
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      // timezone:'Z' → mysql2 devuelve TIMESTAMP en UTC, no en la zona local del
-      // proceso (ver server/_core/dbConfig.ts). Crítico para el calendario de cobros.
-      _db = drizzle({ connection: dbConnectionConfig() });
+      // Supabase exige TLS. Las columnas son timestamptz; node-postgres devuelve
+      // Date en UTC, así que el calendario de cobros no depende de la zona del proceso.
+      const connectionString = process.env.DATABASE_URL.replace(/([?&])sslmode=[^&]*/g, "").replace(/[?&]$/, "");
+      const pool = new pg.Pool({
+        connectionString,
+        ssl: { rejectUnauthorized: false },
+      });
+      _db = drizzle(pool);
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
@@ -49,21 +66,20 @@ export async function getDb() {
 export async function getTrialConversionRows() {
   const db = await getDb();
   if (!db) return { subs: [] as any[], charges: [] as any[] };
-  const [subRows]: any = await db.execute(sql`
-    SELECT s.userId, u.email, s.trialDays, s.trialHours, s.cancelAtPeriodEnd, s.status, s.declineCategory,
-      DATE_FORMAT(DATE_SUB(DATE(CONVERT_TZ(s.createdAt,'+00:00','+02:00')),
-        INTERVAL WEEKDAY(CONVERT_TZ(s.createdAt,'+00:00','+02:00')) DAY), '%Y-%m-%d') AS altaWeek,
-      UNIX_TIMESTAMP(s.createdAt)*1000 AS createdAtMs,
-      UNIX_TIMESTAMP(s.currentPeriodEnd)*1000 AS periodEndMs,
-      (SELECT COUNT(*) FROM charges c WHERE c.userId=s.userId AND c.provider='mit' AND c.status='ok'
-         AND (c.sipayOrder IS NULL OR c.sipayOrder NOT LIKE 'mit-upgrade-%')) AS mitOk
-    FROM subscriptions s LEFT JOIN users u ON u.id=s.userId
-    WHERE s.createdAt >= (UTC_TIMESTAMP() - INTERVAL 70 DAY)`);
-  const [chargeRows]: any = await db.execute(sql`
-    SELECT userId, amountCents, (status='ok') AS ok,
-      UNIX_TIMESTAMP(createdAt)*1000 AS createdAtMs,
-      (sipayOrder LIKE 'mit-upgrade-%') AS isUpgrade
-    FROM charges WHERE provider='mit' AND createdAt >= (UTC_TIMESTAMP() - INTERVAL 60 DAY)`);
+  const subRows = queryRows(await db.execute(sql`
+    SELECT s."userId", u.email, s."trialDays", s."trialHours", s."cancelAtPeriodEnd", s.status, s."declineCategory",
+      to_char(date_trunc('week', s."createdAt" AT TIME ZONE 'Europe/Madrid'), 'YYYY-MM-DD') AS "altaWeek",
+      EXTRACT(EPOCH FROM s."createdAt") * 1000 AS "createdAtMs",
+      EXTRACT(EPOCH FROM s."currentPeriodEnd") * 1000 AS "periodEndMs",
+      (SELECT COUNT(*) FROM charges c WHERE c."userId"=s."userId" AND c.provider='mit' AND c.status='ok'
+         AND (c."sipayOrder" IS NULL OR c."sipayOrder" NOT LIKE 'mit-upgrade-%')) AS "mitOk"
+    FROM subscriptions s LEFT JOIN users u ON u.id=s."userId"
+    WHERE s."createdAt" >= (NOW() - INTERVAL '70 days')`));
+  const chargeRows = queryRows(await db.execute(sql`
+    SELECT "userId", "amountCents", (status='ok') AS ok,
+      EXTRACT(EPOCH FROM "createdAt") * 1000 AS "createdAtMs",
+      ("sipayOrder" LIKE 'mit-upgrade-%') AS "isUpgrade"
+    FROM charges WHERE provider='mit' AND "createdAt" >= (NOW() - INTERVAL '60 days')`));
   const subs = (subRows as any[]).map((r) => ({
     userId: Number(r.userId), email: r.email ?? null,
     trialDays: r.trialDays == null ? null : Number(r.trialDays),
@@ -85,21 +101,21 @@ export async function getTrialConversionRows() {
 export async function getAdminMobileSummary() {
   const db = await getDb();
   if (!db) return null;
-  const [todayRows]: any = await db.execute(sql`
+  const todayRows = queryRows(await db.execute(sql`
     SELECT
-      SUM(amountCents <= 100 AND status='ok') AS altas,
-      SUM(provider='mit' AND status='ok') AS renov,
-      SUM(CASE WHEN status='ok' THEN amountCents ELSE 0 END) AS totalCents
+      SUM(CASE WHEN "amountCents" <= 100 AND status='ok' THEN 1 ELSE 0 END) AS altas,
+      SUM(CASE WHEN provider='mit' AND status='ok' THEN 1 ELSE 0 END) AS renov,
+      SUM(CASE WHEN status='ok' THEN "amountCents" ELSE 0 END) AS "totalCents"
     FROM charges
-    WHERE DATE(CONVERT_TZ(createdAt,'+00:00','+02:00')) = DATE(CONVERT_TZ(UTC_TIMESTAMP(),'+00:00','+02:00'))`);
-  const [okRows]: any = await db.execute(sql`
-    SELECT provider, amountCents, sipayMaskedCard,
-      DATE_FORMAT(CONVERT_TZ(createdAt,'+00:00','+02:00'),'%d/%m %H:%i') AS whenM
-    FROM charges WHERE status='ok' ORDER BY createdAt DESC LIMIT 8`);
-  const [failRows]: any = await db.execute(sql`
-    SELECT provider, amountCents, sipayMaskedCard, errorDetail,
-      DATE_FORMAT(CONVERT_TZ(createdAt,'+00:00','+02:00'),'%d/%m %H:%i') AS whenM
-    FROM charges WHERE status='failed' ORDER BY createdAt DESC LIMIT 8`);
+    WHERE ("createdAt" AT TIME ZONE 'Europe/Madrid')::date = (NOW() AT TIME ZONE 'Europe/Madrid')::date`));
+  const okRows = queryRows(await db.execute(sql`
+    SELECT provider, "amountCents", "sipayMaskedCard",
+      to_char("createdAt" AT TIME ZONE 'Europe/Madrid', 'DD/MM HH24:MI') AS "whenM"
+    FROM charges WHERE status='ok' ORDER BY "createdAt" DESC LIMIT 8`));
+  const failRows = queryRows(await db.execute(sql`
+    SELECT provider, "amountCents", "sipayMaskedCard", "errorDetail",
+      to_char("createdAt" AT TIME ZONE 'Europe/Madrid', 'DD/MM HH24:MI') AS "whenM"
+    FROM charges WHERE status='failed' ORDER BY "createdAt" DESC LIMIT 8`));
   const t = (todayRows as any[])[0] ?? {};
   return {
     today: {
@@ -156,7 +172,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
     if (!values.lastSignedIn) values.lastSignedIn = new Date();
     if (Object.keys(updateSet).length === 0) updateSet.lastSignedIn = new Date();
 
-    await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
+    await db.insert(users).values(values).onConflictDoUpdate({ target: users.openId, set: updateSet });
   } catch (error) {
     console.error("[Database] Failed to upsert user:", error);
     throw error;
@@ -635,7 +651,7 @@ export async function setSiteSetting(key: string, value: string) {
   await db
     .insert(siteSettings)
     .values({ key, value })
-    .onDuplicateKeyUpdate({ set: { value, updatedAt: new Date() } });
+    .onConflictDoUpdate({ target: siteSettings.key, set: { value, updatedAt: new Date() } });
 }
 
 export async function getAllSiteSettings() {
@@ -1553,7 +1569,7 @@ export async function getGclidConversions(opts?: { days?: number }) {
     // UNIX_TIMESTAMP sidesteps a mysql2 timezone quirk that otherwise reads the
     // stored time ~2h behind real UTC — which would put the conversion BEFORE
     // the ad click and get the whole CSV rejected by Google Ads.
-    createdAtEpoch: sql<number>`UNIX_TIMESTAMP(${charges.createdAt})`,
+    createdAtEpoch: sql<number>`EXTRACT(EPOCH FROM ${charges.createdAt})`,
     provider: charges.provider,
   }).from(charges)
     .where(and(isNotNull(charges.gclid), eq(charges.status, "ok"), gte(charges.createdAt, since)))
@@ -1706,13 +1722,13 @@ export async function getDailyIntroCharges(opts: { from: Date; to: Date }) {
   const db = await getDb();
   if (!db) return [] as { day: string; count: number; eur: number }[];
   const rows = await db.select({
-    day: sql<string>`DATE_FORMAT(${charges.createdAt}, '%Y-%m-%d')`,
+    day: sql<string>`to_char(${charges.createdAt} AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD')`,
     count: sql<number>`COUNT(*)`,
     eur: sql<number>`ROUND(SUM(${charges.amountCents}) / 100, 2)`,
   }).from(charges)
     .where(sql`${charges.createdAt} >= ${opts.from} AND ${charges.createdAt} <= ${opts.to} AND ${charges.status} <> 'failed' AND ${charges.amountCents} <= 100`)
-    .groupBy(sql`DATE_FORMAT(${charges.createdAt}, '%Y-%m-%d')`)
-    .orderBy(sql`DATE_FORMAT(${charges.createdAt}, '%Y-%m-%d') DESC`);
+    .groupBy(sql`to_char(${charges.createdAt} AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD')`)
+    .orderBy(sql`to_char(${charges.createdAt} AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD') DESC`);
   // COUNT/SUM come back as strings from the driver — coerce to numbers.
   return rows.map((r) => ({ day: r.day, count: Number(r.count), eur: Number(r.eur) }));
 }
