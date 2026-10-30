@@ -1,0 +1,4114 @@
+/* =============================================================
+   PDF Editor Online Admin Panel — Dashboard completo
+   MRR, ARR, estadísticas de facturación, usuarios, pagos, legal
+   ============================================================= */
+import { useState, useMemo, useEffect, useRef } from "react";
+import { useLocation } from "wouter";
+import { useAuth } from "@/_core/hooks/useAuth";
+import { trpc } from "@/lib/trpc";
+import { brandName, isFastDoc } from "@/lib/brand";
+import { detectLanguage } from "@/lib/detectLang";
+import { toast } from "sonner";
+import {
+  AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+} from "recharts";
+import {
+  Users, DollarSign, TrendingUp, TrendingDown, MessageSquare, FileText,
+  Search, Trash2, ShieldCheck, ShieldOff, Mail, ChevronDown, ChevronUp,
+  CreditCard, Settings, BookOpen, BarChart2, UserX, RefreshCw, Eye, EyeOff,
+  ArrowLeft, Crown, Rss, Star, Calendar, Zap, AlertTriangle, RotateCcw,
+  Webhook, ClipboardList, StickyNote, X, Loader2, Check,
+} from "lucide-react";
+
+// Date-range presets used by the Billing tab. "today" includes today only,
+// "yesterday" only yesterday, the rest are rolling N-day windows.
+type RangePreset = "today" | "yesterday" | "7d" | "30d" | "month" | "ytd" | "custom";
+function rangeFromPreset(preset: RangePreset, customFrom?: string, customTo?: string): { from: Date; to: Date; label: string } {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  switch (preset) {
+    case "today":
+      return { from: startOfToday, to: now, label: "Hoy" };
+    case "yesterday": {
+      const start = new Date(startOfToday); start.setDate(start.getDate() - 1);
+      const end = new Date(startOfToday); end.setMilliseconds(end.getMilliseconds() - 1);
+      return { from: start, to: end, label: "Ayer" };
+    }
+    case "7d": {
+      const start = new Date(startOfToday); start.setDate(start.getDate() - 6);
+      return { from: start, to: now, label: "Últimos 7 días" };
+    }
+    case "30d": {
+      const start = new Date(startOfToday); start.setDate(start.getDate() - 29);
+      return { from: start, to: now, label: "Últimos 30 días" };
+    }
+    case "month":
+      return { from: new Date(now.getFullYear(), now.getMonth(), 1), to: now, label: "Mes actual" };
+    case "ytd":
+      return { from: new Date(now.getFullYear(), 0, 1), to: now, label: "Año actual" };
+    case "custom": {
+      const from = customFrom ? new Date(customFrom) : startOfToday;
+      const to = customTo ? new Date(customTo + "T23:59:59") : now;
+      return { from, to, label: "Personalizado" };
+    }
+  }
+}
+import BlogAdmin from "./BlogAdmin";
+import TrustpilotAdmin from "./TrustpilotAdmin";
+import PaywallModal from "@/components/PaywallModal";
+
+type AdminTab = "overview" | "billing" | "consent" | "conversion" | "users" | "subscribers" | "documents" | "canceled" | "coupons" | "messages" | "webhooks" | "audit" | "legal" | "settings" | "blog" | "trustpilot";
+
+// ── Bloque "Conversión de trial a suscripción" ──────────────────────────────
+type CvRate = { ok: number; n: number; pct: number | null; insufficient: boolean };
+function RateLine({ label, r, big }: { label: string; r: CvRate; big?: boolean }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 py-1">
+      <span className={`text-white/60 ${big ? "text-sm" : "text-xs"}`}>{label}</span>
+      <span className="flex items-baseline gap-2">
+        <span className={`font-bold tabular-nums ${big ? "text-2xl text-white" : "text-base text-white/90"}`}>
+          {r.pct == null ? "—" : `${r.pct}%`}
+        </span>
+        <span className="text-xs text-white/50 tabular-nums">· {r.ok}/{r.n}</span>
+        {r.insufficient && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 whitespace-nowrap">muestra insuf.</span>}
+      </span>
+    </div>
+  );
+}
+function ConversionPanel({ q }: { q: { data?: any; isLoading: boolean; error?: any } }) {
+  const d = q.data;
+  const eur = d ? (d.currentAmountCents / 100).toFixed(2).replace(".", ",") : "29,95";
+  if (q.isLoading) return <div className="text-white/60 text-sm">Cargando conversión…</div>;
+  if (!d) return <div className="text-white/60 text-sm">Sin datos.</div>;
+  const win = (w: any, title: string, pending?: boolean) => (
+    <div className="flex-1 bg-[#141416] border border-white/10 rounded-xl p-4">
+      <div className="text-xs uppercase tracking-wide text-white/40 mb-2">{title}</div>
+      <RateLine label={`Aprobado 1er intento (${eur}€)`} r={w.first} big />
+      <RateLine label={`Aprobado final (con reintentos)${pending ? " *" : ""}`} r={w.final} />
+      <RateLine label="Otros importes (final)" r={w.other} />
+      {pending && <p className="text-[10px] text-white/40 mt-1.5">* reintentos aún pendientes en ciclos recientes → el final solo subirá</p>}
+    </div>
+  );
+  return (
+    <div className="space-y-6">
+      <a href="/es/admin/movil" className="inline-flex items-center gap-1.5 text-xs text-white/50 hover:text-white/80 underline">
+        📱 Vista móvil / instalar como app
+      </a>
+      {/* BLOQUE 1 */}
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-white font-semibold">Aceptación de MIT</h3>
+          <span className="text-xs text-white/50">Baseline fija: <b className="text-white/80">35,3%</b> (2 sem. previas al 4-ago)</span>
+        </div>
+        <div className="flex flex-col md:flex-row gap-3">
+          {win(d.block1.d7, "Últimos 7 días", true)}
+          {win(d.block1.d30, "Últimos 30 días")}
+        </div>
+      </section>
+
+      {/* BLOQUE 2 */}
+      <section>
+        <h3 className="text-white font-semibold mb-2">Trial → suscriptor de pago (por semana de alta)</h3>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm text-white/90 border-collapse">
+            <thead>
+              <tr className="text-white/50 text-xs">
+                {["Semana", "Cohorte", "Altas", "Vencidas", "Cancel. pre-cobro", "Cobradas", "Fallidas", "Conversión"].map(h => (
+                  <th key={h} className="text-left font-medium py-2 px-2 border-b border-white/10">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {d.block2.map((r: any, i: number) => (
+                <tr key={i} className="border-b border-white/5">
+                  <td className="py-1.5 px-2 tabular-nums">{r.week}</td>
+                  <td className="py-1.5 px-2">
+                    <span className={`px-1.5 py-0.5 rounded text-xs ${r.cohort === "24h" ? "bg-red-500/20 text-red-300" : r.cohort === "7d" ? "bg-blue-500/20 text-blue-300" : "bg-white/10 text-white/70"}`}>{r.cohort}</span>
+                    {r.inProgress && <span className="ml-1 text-[10px] px-1 py-0.5 rounded bg-emerald-500/15 text-emerald-300">en curso</span>}
+                  </td>
+                  <td className="py-1.5 px-2 tabular-nums">{r.altas}</td>
+                  <td className="py-1.5 px-2 tabular-nums text-white/60">{r.trialEnded}</td>
+                  <td className="py-1.5 px-2 tabular-nums text-amber-300/90">{r.canceledPre}</td>
+                  <td className="py-1.5 px-2 tabular-nums text-emerald-300">{r.paid}</td>
+                  <td className="py-1.5 px-2 tabular-nums text-red-300/80">{r.failed}</td>
+                  <td className="py-1.5 px-2 tabular-nums font-semibold">
+                    {r.convPct == null ? "—" : `${r.convPct}%`} <span className="text-white/40 text-xs">· {r.paid}/{r.altas}</span>
+                    {r.insufficient && <span className="ml-1 text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-300">n&lt;20</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="text-xs text-white/40 mt-1">24h, 48h y 7d son cohortes distintas (no se mezclan). "En curso" = aún quedan subs sin vencer el trial → la conversión subirá.</p>
+      </section>
+
+      {/* BLOQUE 3 */}
+      <section>
+        <h3 className="text-white font-semibold mb-2">Dónde se pierden (últimos 30 días)</h3>
+        <div className="bg-[#141416] border border-white/10 rounded-xl p-4">
+          {d.block3.total === 0 ? (
+            <div className="text-white/50 text-sm">Sin pérdidas registradas en la ventana.</div>
+          ) : (
+            <>
+              <div className="text-xs text-white/50 mb-2">Total no convertidas y perdidas: <b className="text-white/90">{d.block3.total}</b>
+                {d.block3.insufficient && <span className="ml-1 text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-300">muestra insuf.</span>}</div>
+              {([
+                ["Canceladas por el usuario (durante el trial)", d.block3.usuario, d.block3.pct?.usuario],
+                ["Código duro (tarjeta muerta)", d.block3.codigoDuro, d.block3.pct?.codigoDuro],
+                ["Bloqueadas (172/174 · blocked_provider)", d.block3.blockedProvider, d.block3.pct?.blockedProvider],
+                ["Reintentos agotados", d.block3.reintentosAgotados, d.block3.pct?.reintentosAgotados],
+              ] as [string, number, number | undefined][]).map(([label, n, pct]) => (
+                <div key={label} className="py-1">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-white/70">{label}</span>
+                    <span className="tabular-nums text-white/90"><b>{n}</b> <span className="text-white/40 text-xs">· {pct ?? 0}%</span></span>
+                  </div>
+                  <div className="h-1.5 rounded bg-white/5 mt-1 overflow-hidden">
+                    <div className="h-full bg-red-400/60 rounded" style={{ width: `${pct ?? 0}%` }} />
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </section>
+      <p className="text-xs text-white/30">Cuentas de prueba internas excluidas · conexión UTC, agrupación Europe/Madrid.</p>
+    </div>
+  );
+}
+
+export default function Admin() {
+  const [, navigate] = useLocation();
+  const { user, isAuthenticated, loading } = useAuth();
+  const [tab, setTab] = useState<AdminTab>("overview");
+  const [userSearch, setUserSearch] = useState("");
+  const [expandedMsg, setExpandedMsg] = useState<number | null>(null);
+  const [editingLegal, setEditingLegal] = useState<string | null>(null);
+  const [legalTitle, setLegalTitle] = useState("");
+  const [legalContent, setLegalContent] = useState("");
+
+
+  // Date range for Billing tab. Must be memoized — recalculating on every
+  // render produces a fresh `to = new Date()` every time, which changes the
+  // ISO string and retriggers the useQuery, causing an infinite refetch loop.
+  const [rangePreset, setRangePreset] = useState<RangePreset>("today");
+  const [customFrom, setCustomFrom] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  const [customTo, setCustomTo] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  const range = useMemo(
+    () => rangeFromPreset(rangePreset, customFrom, customTo),
+    [rangePreset, customFrom, customTo]
+  );
+  const rangeFromISO = range.from.toISOString();
+  const rangeToISO = range.to.toISOString();
+
+  // Queries
+  const statsQ = trpc.admin.stats.useQuery(undefined, { enabled: !!user && user.role === "admin" });
+  const billingQ = trpc.admin.billingStats.useQuery(
+    { from: rangeFromISO, to: rangeToISO },
+    { enabled: !!user && user.role === "admin" && tab === "billing" }
+  );
+  const conversionQ = trpc.admin.trialConversion.useQuery(
+    undefined,
+    { enabled: !!user && user.role === "admin" && tab === "conversion" }
+  );
+  const revenueQ = trpc.admin.revenue.useQuery(
+    { from: rangeFromISO, to: rangeToISO },
+    { enabled: !!user && user.role === "admin" && tab === "billing", staleTime: 60 * 1000 }
+  );
+  const dailyIntroQ = trpc.admin.dailyIntroCharges.useQuery(
+    { from: rangeFromISO, to: rangeToISO },
+    { enabled: !!user && user.role === "admin" && tab === "billing", staleTime: 60 * 1000 }
+  );
+  const subsAboutToCancelQ = trpc.admin.subsAboutToCancel.useQuery(undefined, {
+    enabled: !!user && user.role === "admin" && tab === "billing",
+  });
+  const pastDueSubsQ = trpc.admin.pastDueSubs.useQuery(undefined, {
+    enabled: !!user && user.role === "admin" && tab === "billing",
+  });
+  const recentSubsNoPayQ = trpc.admin.recentSubsWithoutPayment.useQuery({ hours: 24 }, {
+    enabled: !!user && user.role === "admin" && tab === "billing",
+  });
+  const pendingOrphansQ = trpc.admin.pendingOrphanPayments.useQuery({ hoursBack: 48 }, {
+    enabled: !!user && user.role === "admin" && tab === "billing",
+    refetchInterval: tab === "billing" ? 30000 : false,
+  });
+  const recoverOrphanMut = trpc.admin.recoverOrphanPayment.useMutation({
+    onSuccess: (r) => {
+      if (r.alreadyFinalized) {
+        toast.success("Ya estaba reconciliado — no se ha duplicado nada.");
+      } else if (r.ok) {
+        toast.success(`Pago recuperado: txn=${r.txn} userId=${r.userId}`);
+      } else {
+        toast.error(`No se pudo recuperar: ${r.errorMessage ?? "error desconocido"}`);
+      }
+      utils.admin.pendingOrphanPayments.invalidate();
+      utils.admin.subscribedUsers.invalidate();
+      utils.admin.billingStats.invalidate();
+      utils.admin.revenue.invalidate();
+    },
+    onError: (err) => toast.error(err.message || "Error reconciliando pago"),
+  });
+  const chargesQ = trpc.admin.charges.useQuery({ limit: 50 }, {
+    enabled: !!user && user.role === "admin" && tab === "billing",
+  });
+  const gclidConvQ = trpc.admin.gclidConversions.useQuery(undefined, {
+    enabled: !!user && user.role === "admin" && tab === "billing",
+  });
+  const refundMut = trpc.admin.refundCharge.useMutation({
+    onSuccess: (r) => {
+      toast.success(`Reembolso OK: ${formatEur(r.amountEur)} (${r.id})`);
+      utils.admin.charges.invalidate();
+      utils.admin.revenue.invalidate();
+    },
+    onError: (err) => toast.error(err.message || "Error al reembolsar"),
+  });
+  const usersQ = trpc.admin.users.useQuery({ search: userSearch }, { enabled: !!user && user.role === "admin" && tab === "users" });
+  const subscribersQ = trpc.admin.subscribedUsers.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "subscribers" });
+  const [docSearch, setDocSearch] = useState("");
+  const docsQ = trpc.admin.documents.useQuery({ search: docSearch }, { enabled: !!user && user.role === "admin" && tab === "documents" });
+  const storageQ = trpc.admin.storageByUser.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "documents" });
+  const canceledQ = trpc.admin.canceledSubscriptions.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "canceled" });
+  const webhookEventsQ = trpc.admin.webhookEvents.useQuery({ limit: 100 }, { enabled: !!user && user.role === "admin" && tab === "webhooks", refetchInterval: tab === "webhooks" ? 15000 : false });
+  const auditLogQ = trpc.admin.auditLog.useQuery({ limit: 100 }, { enabled: !!user && user.role === "admin" && tab === "audit" });
+  // Coupons removed in the Sipay migration; the tab now renders a placeholder.
+  const couponsQ = { data: undefined, isLoading: false, refetch: () => {} } as any;
+  const resetTrialMut = trpc.admin.resetMyTrialUsage.useMutation({
+    onSuccess: (r) => toast.success(`Trial reseteado (${r.affected} docs)`),
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const simulateTrialMut = trpc.admin.simulateTrialLimitReached.useMutation({
+    onSuccess: (r) => {
+      if (!r.success) toast.error(r.error || "No se pudo simular");
+      else toast.success(`Marcados ${r.stamped} docs. Ahora intenta descargar → debería aparecer paywall.`);
+    },
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const createFakeSubMut = trpc.admin.createFakeTrialSub.useMutation({
+    onSuccess: (r) => {
+      if (!r.success) toast.error(r.error || "No se pudo crear");
+      else toast.success(`Sub trial falsa creada (pedido: ${(r as any).fakeOrder ?? r}). Ahora eres "trial". Prueba el flujo.`);
+    },
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const deleteFakeSubMut = trpc.admin.deleteFakeTrialSub.useMutation({
+    onSuccess: (r) => toast.success(`Sub trial falsa eliminada (${r.affected} rows)`),
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const [previewPaywallReason, setPreviewPaywallReason] = useState<"standard" | "trial-limit" | null>(null);
+  const createCouponMut = { mutate: () => {}, isPending: false } as any;
+  const deleteCouponMut = { mutate: () => {}, isPending: false } as any;
+  const cancelReasonsQ = trpc.admin.cancelReasons.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "billing" });
+  const geoQ = trpc.admin.revenueByCountry.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "billing" });
+  const healthQ = trpc.admin.healthChecks.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "overview", refetchInterval: tab === "overview" ? 30000 : false });
+  // Live visitors counter — polled every 5 s when the Resumen tab is open.
+  // Backed by the in-memory presence tracker on the server.
+  const liveVisitorsQ = trpc.admin.liveVisitors.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "overview", refetchInterval: tab === "overview" ? 5000 : false });
+  const [timelineUserId, setTimelineUserId] = useState<number | null>(null);
+  const timelineQ = trpc.admin.userTimeline.useQuery(
+    { userId: timelineUserId ?? 0 },
+    { enabled: timelineUserId !== null }
+  );
+  const updateNotesMut = trpc.admin.updateUserNotes.useMutation({
+    onSuccess: () => {
+      toast.success("Notas guardadas");
+      utils.admin.users.invalidate();
+    },
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const messagesQ = trpc.admin.contactMessages.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "messages" });
+  const emailTemplatesQ = trpc.admin.emailTemplates.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "messages" });
+  const legalQ = trpc.admin.legalPages.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "legal" });
+  const settingsQ = trpc.admin.settings.useQuery(undefined, { enabled: !!user && user.role === "admin" && tab === "settings" });
+  // Live monthly price — always fetched (public, cached) so template replies on
+  // the Mensajes tab can substitute {{price}} even though settingsQ is settings-only.
+  const pricingQ = trpc.site.pricing.useQuery();
+
+  const utils = trpc.useUtils();
+
+  const deleteUserMut = trpc.admin.deleteUser.useMutation({
+    onSuccess: () => { toast.success("Usuario eliminado"); utils.admin.users.invalidate(); },
+    onError: () => toast.error("Error al eliminar usuario"),
+  });
+
+  const cancelSubMut = trpc.admin.cancelUserSubscription.useMutation({
+    onSuccess: () => { toast.success("Suscripción cancelada — no renovará"); utils.admin.users.invalidate(); },
+    onError: () => toast.error("Error al cancelar la suscripción"),
+  });
+
+  const promoteUserMut = trpc.admin.promoteUser.useMutation({
+    onSuccess: () => { toast.success("Rol actualizado"); utils.admin.users.invalidate(); },
+    onError: () => toast.error("Error al actualizar rol"),
+  });
+
+  const markReadMut = trpc.admin.markMessageRead.useMutation({
+    onSuccess: () => utils.admin.contactMessages.invalidate(),
+  });
+
+  const deleteMessageMut = trpc.admin.deleteMessage.useMutation({
+    onSuccess: () => {
+      toast.success("Mensaje eliminado");
+      utils.admin.contactMessages.invalidate();
+      setExpandedMsg(null);
+    },
+    onError: (err) => toast.error(err.message || "Error al eliminar"),
+  });
+
+  const bulkDeleteMut = trpc.admin.bulkDeleteMessages.useMutation({
+    onSuccess: (r) => {
+      toast.success(`${r.count} mensaje${r.count !== 1 ? "s" : ""} eliminado${r.count !== 1 ? "s" : ""}`);
+      utils.admin.contactMessages.invalidate();
+      setSelectedMessages(new Set());
+    },
+    onError: (err) => toast.error(err.message || "Error al eliminar"),
+  });
+
+  const bulkArchiveMut = trpc.admin.bulkArchiveMessages.useMutation({
+    onSuccess: (r, vars) => {
+      toast.success(`${r.count} mensaje${r.count !== 1 ? "s" : ""} ${vars.archived ? "archivado" : "desarchivado"}${r.count !== 1 ? "s" : ""}`);
+      utils.admin.contactMessages.invalidate();
+      setSelectedMessages(new Set());
+    },
+    onError: (err) => toast.error(err.message || "Error al archivar"),
+  });
+
+  // Multi-select state for bulk actions on the Mensajes tab.
+  const [selectedMessages, setSelectedMessages] = useState<Set<number>>(new Set());
+  const [showArchived, setShowArchived] = useState(false);
+
+  // Group messages by email so we can flag recurring senders. Same email
+  // = same person, even if they typed a different "name" each time.
+  // Sorted ascending so prior-thread display reads chronologically.
+  const messagesByEmail = useMemo(() => {
+    const map: Record<string, typeof messagesQ.data extends (infer T)[] | undefined ? T[] : never> = {};
+    for (const m of messagesQ.data ?? []) {
+      const key = m.email.toLowerCase();
+      if (!map[key]) map[key] = [];
+      map[key].push(m);
+    }
+    for (const k of Object.keys(map)) {
+      map[k].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    }
+    return map;
+  }, [messagesQ.data]);
+
+  const replyMessageMut = trpc.admin.replyToMessage.useMutation({
+    onSuccess: () => {
+      toast.success("Respuesta enviada por email");
+      utils.admin.contactMessages.invalidate();
+    },
+    onError: (err) => toast.error(err.message || "No se pudo enviar la respuesta"),
+  });
+  const [replyDraft, setReplyDraft] = useState<Record<number, string>>({});
+  const [showTemplateManager, setShowTemplateManager] = useState(false);
+
+  const createTemplateMut = trpc.admin.createEmailTemplate.useMutation({
+    onSuccess: () => { toast.success("Plantilla creada"); utils.admin.emailTemplates.invalidate(); },
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const updateTemplateMut = trpc.admin.updateEmailTemplate.useMutation({
+    onSuccess: () => { toast.success("Plantilla actualizada"); utils.admin.emailTemplates.invalidate(); },
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+  const deleteTemplateMut = trpc.admin.deleteEmailTemplate.useMutation({
+    onSuccess: () => { toast.success("Plantilla borrada"); utils.admin.emailTemplates.invalidate(); },
+    onError: (err) => toast.error(err.message || "Error"),
+  });
+
+  /** Replace {{name}}/{{email}}/{{subject}}/{{price}} with live data. `{{price}}`
+   *  reads the current monthly price from site_settings so anti-chargeback
+   *  replies always quote the amount actually charged, even after a price change. */
+  function applyTemplate(body: string, msg: { name: string; email: string; subject: string }) {
+    const priceStr = pricingQ.data?.priceFormattedEs ?? "19,95€";
+    return body
+      .replace(/\{\{name\}\}/g, msg.name)
+      .replace(/\{\{email\}\}/g, msg.email)
+      .replace(/\{\{subject\}\}/g, msg.subject)
+      .replace(/\{\{price\}\}/g, priceStr);
+  }
+
+  const saveLegalMut = trpc.admin.saveLegalPage.useMutation({
+    onSuccess: () => {
+      toast.success("Página legal guardada");
+      setEditingLegal(null);
+      utils.admin.legalPages.invalidate();
+    },
+    onError: () => toast.error("Error al guardar"),
+  });
+
+  const saveSettingMut = trpc.admin.saveSetting.useMutation({
+    onSuccess: () => { toast.success("Ajuste guardado"); utils.admin.settings.invalidate(); },
+  });
+
+  // Auth guard
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ backgroundColor: "#0f1117" }}>
+        <div className="w-8 h-8 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (!isAuthenticated || user?.role !== "admin") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4" style={{ backgroundColor: "#0f1117" }}>
+        <p className="text-white text-lg">Acceso restringido a administradores</p>
+        <button
+          onClick={() => navigate("/")}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-white"
+          style={{ backgroundColor: "#E63946" }}
+        >
+          Volver al inicio
+        </button>
+      </div>
+    );
+  }
+
+  const stats = statsQ.data;
+  const billing = billingQ.data;
+
+  const tabs: { id: AdminTab; label: string; icon: React.ReactNode }[] = [
+    { id: "overview", label: "Resumen", icon: <BarChart2 size={16} /> },
+    { id: "billing", label: "Facturación & MRR", icon: <DollarSign size={16} /> },
+    { id: "conversion", label: "Conversión trial", icon: <TrendingUp size={16} /> },
+    { id: "users", label: "Usuarios", icon: <Users size={16} /> },
+    { id: "subscribers", label: "Suscriptores", icon: <Crown size={16} /> },
+    { id: "documents", label: "Documentos", icon: <FileText size={16} /> },
+    { id: "canceled", label: "Bajas", icon: <UserX size={16} /> },
+    { id: "coupons", label: "Cupones", icon: <TrendingUp size={16} /> },
+    { id: "messages", label: "Mensajes", icon: <MessageSquare size={16} /> },
+    { id: "webhooks", label: "Webhooks", icon: <Webhook size={16} /> },
+    { id: "consent", label: "Consentimiento", icon: <ShieldCheck size={16} /> },
+    { id: "audit", label: "Audit log", icon: <ClipboardList size={16} /> },
+    { id: "legal", label: "Páginas legales", icon: <BookOpen size={16} /> },
+    { id: "settings", label: "Ajustes", icon: <Settings size={16} /> },
+    ...(!isFastDoc ? [{ id: "blog" as AdminTab, label: "Blog", icon: <Rss size={16} /> }] : []),
+    ...(!isFastDoc ? [{ id: "trustpilot" as AdminTab, label: "Trustpilot", icon: <Star size={16} /> }] : []),
+  ];
+
+  const formatEur = (n: number) =>
+    `€${n.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  // Quote CSV cells safely (commas / quotes / newlines are wrapped).
+  const csvEscape = (val: unknown): string => {
+    if (val === null || val === undefined) return "";
+    const s = val instanceof Date ? val.toISOString() : String(val);
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const downloadCsv = (rows: Record<string, unknown>[], filename: string) => {
+    if (!rows.length) return;
+    const headers = Object.keys(rows[0]);
+    const body = rows.map((r) => headers.map((h) => csvEscape(r[h])).join(",")).join("\n");
+    const csv = headers.join(",") + "\n" + body;
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // Google Ads "offline conversion import (from clicks)" CSV. Must match the
+  // exact format Google expects: a Parameters line with the timezone, then the
+  // fixed column headers. The conversion NAME must match your Google Ads
+  // conversion action EXACTLY (it has commas, so it's quoted).
+  const GOOGLE_ADS_CONVERSION_NAME = "sin conexión (subida)";
+  const downloadGoogleAdsConversions = () => {
+    const all = gclidConvQ.data ?? [];
+    const rows = all.filter((r) => r.gclidType === "gclid");
+    const skipped = all.length - rows.length; // gbraid/wbraid need a separate format
+    if (!rows.length) {
+      toast.error("Todavía no hay pagos con gclid para exportar.");
+      return;
+    }
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const fmtTime = (d: string | Date) => {
+      const dt = new Date(d);
+      return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())} ${pad(dt.getUTCHours())}:${pad(dt.getUTCMinutes())}:${pad(dt.getUTCSeconds())}`;
+    };
+    const q = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
+    const lines = [
+      "Parameters:TimeZone=+0000",
+      "Google Click ID,Conversion Name,Conversion Time,Conversion Value,Conversion Currency",
+      ...rows.map((r) =>
+        [r.gclid, q(GOOGLE_ADS_CONVERSION_NAME), fmtTime(r.createdAt), r.valueEur.toFixed(2), r.currency].join(","),
+      ),
+    ];
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "editorpdf-google-ads-conversions.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast.success(`${rows.length} conversiones exportadas${skipped ? ` (${skipped} gbraid/wbraid omitidas — formato aparte)` : ""}.`);
+  };
+
+  return (
+    <div className="min-h-screen admin-root" style={{ backgroundColor: "#0f1117", color: "#e2e8f0" }}>
+      {/* Header */}
+      <div
+        className="border-b px-6 py-4 flex items-center justify-between"
+        style={{ borderColor: "#1e2433", backgroundColor: "#0a0d14" }}
+      >
+        <div className="flex items-center gap-3">
+          <button onClick={() => navigate("/")} className="text-gray-400 hover:text-white transition-colors">
+            <ArrowLeft size={18} />
+          </button>
+          <div>
+            <h1 className="text-xl font-bold text-white">Panel de Administración</h1>
+            <p className="text-xs text-gray-400">{brandName} — {user.email}</p>
+          </div>
+        </div>
+        <button
+          onClick={() => {
+            utils.admin.stats.invalidate();
+            utils.admin.billingStats.invalidate();
+            utils.admin.revenue.invalidate();
+            utils.admin.subsAboutToCancel.invalidate();
+            utils.admin.pastDueSubs.invalidate();
+          }}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-white transition-colors"
+          style={{ backgroundColor: "#1e2433" }}
+        >
+          <RefreshCw size={13} />
+          Actualizar
+        </button>
+      </div>
+
+      <div className="flex">
+        {/* Sidebar */}
+        <aside
+          className="w-52 min-h-[calc(100vh-64px)] border-r flex-shrink-0"
+          style={{ borderColor: "#1e2433", backgroundColor: "#0a0d14" }}
+        >
+          <nav className="p-3 flex flex-col gap-1">
+            {tabs.map((t) => {
+              const unread = t.id === "messages" ? (stats?.unreadMessages ?? 0) : 0;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setTab(t.id)}
+                  className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium text-left transition-colors w-full"
+                  style={{
+                    backgroundColor: tab === t.id ? "#C82F3B" : "transparent",
+                    color: tab === t.id ? "white" : "#94a3b8",
+                  }}
+                  onMouseEnter={(e) => { if (tab !== t.id) e.currentTarget.style.backgroundColor = "#1e2433"; }}
+                  onMouseLeave={(e) => { if (tab !== t.id) e.currentTarget.style.backgroundColor = "transparent"; }}
+                >
+                  {t.icon}
+                  <span className="flex-1">{t.label}</span>
+                  {unread > 0 && (
+                    <span
+                      className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1.5 rounded-full text-[10px] font-bold text-white"
+                      style={{ backgroundColor: "#E63946" }}
+                    >
+                      {unread > 99 ? "99+" : unread}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </aside>
+
+        {/* Main content */}
+        <main className="flex-1 p-6 overflow-auto">
+
+          {/* ── OVERVIEW ── */}
+          {tab === "overview" && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-white">Resumen general</h2>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                {[
+                  { label: "Total usuarios", value: stats?.totalUsers ?? "—", icon: <Users size={20} />, color: "#E63946" },
+                  { label: "Suscripciones activas", value: stats?.activeSubscriptions ?? "—", icon: <CreditCard size={20} />, color: "#10b981" },
+                  { label: "Documentos", value: stats?.totalDocuments ?? "—", icon: <FileText size={20} />, color: "#8b5cf6" },
+                  { label: "Mensajes sin leer", value: stats?.unreadMessages ?? "—", icon: <MessageSquare size={20} />, color: "#f59e0b" },
+                ].map((card) => (
+                  <div
+                    key={card.label}
+                    className="rounded-xl p-4 border"
+                    style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                  >
+                    <div className="flex items-center justify-between mb-3">
+                      <p className="text-xs text-gray-400">{card.label}</p>
+                      <div
+                        className="w-8 h-8 rounded-lg flex items-center justify-center"
+                        style={{ backgroundColor: card.color + "20", color: card.color }}
+                      >
+                        {card.icon}
+                      </div>
+                    </div>
+                    <p className="text-2xl font-bold text-white">{card.value}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div
+                className="rounded-xl p-5 border"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+              >
+                <p className="text-sm font-semibold text-white mb-1">Estadísticas de facturación</p>
+                <p className="text-xs text-gray-400 mb-4">
+                  Accede a la pestaña "Facturación &amp; MRR" para el análisis completo con gráficas.
+                </p>
+                <button
+                  onClick={() => setTab("billing")}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors"
+                  style={{ backgroundColor: "#E63946" }}
+                >
+                  Ver estadísticas de facturación →
+                </button>
+              </div>
+
+              {/* ── LIVE VISITORS (real-time, polled every 5s) ── */}
+              <div
+                className="rounded-xl border overflow-hidden"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+              >
+                <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                  <div>
+                    <p className="text-sm font-semibold text-white flex items-center gap-2">
+                      <span className="relative inline-flex w-2 h-2">
+                        <span className="absolute inline-flex h-full w-full rounded-full opacity-75 animate-ping" style={{ backgroundColor: "#10b981" }} />
+                        <span className="relative inline-flex rounded-full h-2 w-2" style={{ backgroundColor: "#10b981" }} />
+                      </span>
+                      Visitantes en directo
+                    </p>
+                    <p className="text-[11px] text-gray-500 mt-0.5">Sesiones activas en los últimos 60s. Auto-refresca cada 5s.</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-3xl font-extrabold text-white leading-none">{liveVisitorsQ.data?.count ?? 0}</p>
+                    <p className="text-[10px] text-gray-500 mt-1 uppercase tracking-[0.1em]">online ahora</p>
+                  </div>
+                </div>
+                {liveVisitorsQ.data?.paths && liveVisitorsQ.data.paths.length > 0 && (
+                  <div className="divide-y" style={{ borderColor: "#1e2433" }}>
+                    {liveVisitorsQ.data.paths.slice(0, 8).map((p: any) => (
+                      <div key={p.path} className="flex items-center justify-between px-5 py-2" style={{ borderColor: "#1e2433" }}>
+                        <span className="text-[12px] text-gray-300 font-mono truncate max-w-[60%]">{p.path || "(sin ruta)"}</span>
+                        <span className="text-[12px] text-white font-bold">{p.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {(!liveVisitorsQ.data || liveVisitorsQ.data.count === 0) && (
+                  <p className="px-5 py-6 text-center text-xs text-gray-500">Sin visitantes activos ahora mismo.</p>
+                )}
+              </div>
+
+              {/* ── HEALTH CHECKS (O1) ── */}
+              <div
+                className="rounded-xl border overflow-hidden"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+              >
+                <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                  <div>
+                    <p className="text-sm font-semibold text-white">Estado de servicios</p>
+                    <p className="text-[11px] text-gray-500 mt-0.5">Comprueba la salud de integraciones críticas. Auto-refresca cada 30s.</p>
+                  </div>
+                  {healthQ.isLoading && (
+                    <RefreshCw size={13} className="animate-spin text-gray-400" />
+                  )}
+                </div>
+                <div className="divide-y" style={{ borderColor: "#1e2433" }}>
+                  {healthQ.data?.map((c: any) => (
+                    <div key={c.name} className="flex items-center justify-between px-5 py-3" style={{ borderColor: "#1e2433" }}>
+                      <div className="flex items-center gap-3">
+                        <span
+                          className="w-2.5 h-2.5 rounded-full"
+                          style={{ backgroundColor: c.ok ? "#10b981" : "#ef4444", boxShadow: c.ok ? "0 0 8px #10b981" : "0 0 8px #ef4444" }}
+                        />
+                        <div>
+                          <p className="text-sm text-white font-medium">{c.name}</p>
+                          {!c.ok && c.detail && (
+                            <p className="text-[11px] text-red-300 mt-0.5 font-mono">{c.detail}</p>
+                          )}
+                        </div>
+                      </div>
+                      <span className="text-xs text-gray-400 font-mono">{c.latencyMs} ms</span>
+                    </div>
+                  ))}
+                  {!healthQ.data && !healthQ.isLoading && (
+                    <p className="px-5 py-6 text-center text-xs text-gray-500">Sin datos.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── BILLING & MRR ── */}
+          {tab === "billing" && (
+            <div className="space-y-6">
+              <div className="flex items-start justify-between flex-wrap gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold text-white">Facturación &amp; MRR</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    Datos del rango: <span className="text-gray-200 font-medium">{range.label}</span> · {range.from.toLocaleString("es-ES")} → {range.to.toLocaleString("es-ES")}
+                  </p>
+                </div>
+              </div>
+
+              {/* Google Ads server-side conversion export */}
+              <div className="rounded-xl p-4 border" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                <div className="flex items-start justify-between flex-wrap gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-white">Conversiones Google Ads (server-side)</p>
+                    <p className="text-xs text-gray-400 mt-0.5 max-w-xl">
+                      {gclidConvQ.data?.filter((r) => r.gclidType === "gclid").length ?? 0} pagos con gclid (últimos 90 días).
+                      Descarga el CSV y súbelo en Google Ads → Objetivos → Conversiones → Importar → Desde clics.
+                      Evita que Safari/adblockers te tumben conversiones de wallets.
+                    </p>
+                  </div>
+                  <button
+                    onClick={downloadGoogleAdsConversions}
+                    disabled={!gclidConvQ.data?.some((r) => r.gclidType === "gclid")}
+                    className="text-xs px-3 py-2 rounded-lg font-semibold text-white disabled:opacity-40 shrink-0"
+                    style={{ backgroundColor: "#E63946" }}
+                  >
+                    Exportar CSV Google Ads
+                  </button>
+                </div>
+              </div>
+
+              {/* Date range picker */}
+              <div className="rounded-xl p-3 border flex flex-wrap items-center gap-2"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                <Calendar size={14} className="text-gray-400 ml-1" />
+                {([
+                  ["today", "Hoy"],
+                  ["yesterday", "Ayer"],
+                  ["7d", "7 días"],
+                  ["30d", "30 días"],
+                  ["month", "Mes"],
+                  ["ytd", "Año"],
+                  ["custom", "Custom"],
+                ] as const).map(([id, label]) => (
+                  <button
+                    key={id}
+                    onClick={() => setRangePreset(id)}
+                    className="px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                    style={{
+                      backgroundColor: rangePreset === id ? "#E63946" : "transparent",
+                      color: rangePreset === id ? "white" : "#94a3b8",
+                      border: rangePreset === id ? "1px solid #E63946" : "1px solid #1e2433",
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+                {rangePreset === "custom" && (
+                  <div className="flex items-center gap-2 ml-2">
+                    <input
+                      type="date"
+                      value={customFrom}
+                      onChange={(e) => setCustomFrom(e.target.value)}
+                      className="px-2 py-1 rounded-md text-xs text-white"
+                      style={{ backgroundColor: "#0a0d14", border: "1px solid #1e2433" }}
+                    />
+                    <span className="text-xs text-gray-500">→</span>
+                    <input
+                      type="date"
+                      value={customTo}
+                      onChange={(e) => setCustomTo(e.target.value)}
+                      className="px-2 py-1 rounded-md text-xs text-white"
+                      style={{ backgroundColor: "#0a0d14", border: "1px solid #1e2433" }}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {billingQ.isLoading ? (
+                <div className="flex flex-col items-center justify-center h-40 gap-3">
+                  <div className="w-6 h-6 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
+                  <p className="text-xs text-gray-500">Cargando datos…</p>
+                </div>
+              ) : billingQ.error ? (
+                <div className="rounded-xl p-5 border" style={{ backgroundColor: "#1a0a0a", borderColor: "#7f1d1d" }}>
+                  <p className="text-sm font-semibold text-red-300 mb-1">Error al cargar facturación</p>
+                  <p className="text-xs text-red-200/80 font-mono">{billingQ.error.message}</p>
+                  <button
+                    onClick={() => billingQ.refetch()}
+                    className="mt-3 px-3 py-1.5 rounded-md text-xs font-medium text-white"
+                    style={{ backgroundColor: "#dc2626" }}
+                  >
+                    Reintentar
+                  </button>
+                </div>
+              ) : billing ? (
+                <>
+                  {/* ── REAL CASH FROM SIPAY (range-aware) ── */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">Ingresos reales (Sipay)</p>
+                      {revenueQ.isLoading && (
+                        <span className="text-[10px] text-gray-500 inline-flex items-center gap-1">
+                          <RefreshCw size={10} className="animate-spin" /> consultando…
+                        </span>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                      {[
+                        {
+                          label: "Ingresos brutos",
+                          value: revenueQ.data ? formatEur(revenueQ.data.grossEur) : "—",
+                          sub: "Cobros antes de comisiones",
+                          icon: <DollarSign size={18} />,
+                          color: "#10b981",
+                        },
+                        {
+                          label: "Ingresos netos",
+                          value: revenueQ.data ? formatEur(revenueQ.data.netEur) : "—",
+                          sub: "Brutos − reembolsos",
+                          icon: <Zap size={18} />,
+                          color: "#22c55e",
+                        },
+                        {
+                          label: "Cobros en rango",
+                          value: revenueQ.data?.chargesCount ?? "—",
+                          sub: `${billing.newSubsInRange} suscripciones nuevas`,
+                          icon: <CreditCard size={18} />,
+                          color: "#8b5cf6",
+                        },
+                        {
+                          label: "Reembolsos",
+                          value: revenueQ.data ? formatEur(revenueQ.data.refundedEur) : "—",
+                          sub: `${revenueQ.data?.refundsCount ?? 0} reembolsos`,
+                          icon: <RotateCcw size={18} />,
+                          color: "#f59e0b",
+                        },
+                      ].map((card) => (
+                        <div
+                          key={card.label}
+                          className="rounded-xl p-4 border"
+                          style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                        >
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-xs text-gray-400">{card.label}</p>
+                            <div
+                              className="w-7 h-7 rounded-lg flex items-center justify-center"
+                              style={{ backgroundColor: card.color + "20", color: card.color }}
+                            >
+                              {card.icon}
+                            </div>
+                          </div>
+                          <p className="text-2xl font-bold text-white">{card.value}</p>
+                          <p className="text-xs text-gray-500 mt-1">{card.sub}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* ── €0,50 INTRO PAYMENTS PER DAY (range-aware) ── */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                        Pagos de 0,50 € por día (altas)
+                      </p>
+                      {dailyIntroQ.data && dailyIntroQ.data.length > 0 && (
+                        <p className="text-xs text-gray-500">
+                          {dailyIntroQ.data.reduce((s, d) => s + d.count, 0)} pagos ·{" "}
+                          {formatEur(dailyIntroQ.data.reduce((s, d) => s + d.eur, 0))} en el rango
+                        </p>
+                      )}
+                    </div>
+                    <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                      {dailyIntroQ.isLoading ? (
+                        <div className="p-4 text-xs text-gray-500 inline-flex items-center gap-1">
+                          <RefreshCw size={12} className="animate-spin" /> cargando…
+                        </div>
+                      ) : !dailyIntroQ.data || dailyIntroQ.data.length === 0 ? (
+                        <div className="p-4 text-xs text-gray-500">Sin pagos de 0,50 € en este rango.</div>
+                      ) : (
+                        <div className="divide-y" style={{ borderColor: "#1e2433" }}>
+                          {(() => {
+                            const maxCount = Math.max(...dailyIntroQ.data.map((d) => d.count), 1);
+                            return dailyIntroQ.data.map((d) => (
+                              <div key={d.day} className="flex items-center gap-3 px-4 py-2">
+                                <span className="text-xs font-mono text-gray-400 w-24 shrink-0">
+                                  {new Date(d.day + "T00:00:00").toLocaleDateString("es-ES", { weekday: "short", day: "2-digit", month: "short" })}
+                                </span>
+                                <div className="flex-1 h-4 rounded-sm overflow-hidden" style={{ backgroundColor: "#0d1017" }}>
+                                  <div
+                                    className="h-full rounded-sm"
+                                    style={{ width: `${(d.count / maxCount) * 100}%`, backgroundColor: "#8b5cf6", minWidth: d.count > 0 ? "2px" : 0 }}
+                                  />
+                                </div>
+                                <span className="text-sm font-bold text-white w-10 text-right shrink-0">{d.count}</span>
+                                <span className="text-xs text-gray-500 w-16 text-right shrink-0">{formatEur(d.eur)}</span>
+                              </div>
+                            ));
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* ── MRR / ARR (point-in-time, NOT range-aware) ── */}
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">MRR · ARR · Churn</p>
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                      {[
+                        {
+                          label: "MRR",
+                          value: formatEur(billing.mrr),
+                          sub: "Solo suscripciones cobrando",
+                          icon: <TrendingUp size={18} />,
+                          color: "#10b981",
+                        },
+                        {
+                          label: "MRR comprometido",
+                          value: formatEur(billing.mrrCommitted),
+                          sub: `Incluye ${billing.trialingSubscriptions} en trial`,
+                          icon: <TrendingUp size={18} />,
+                          color: "#E63946",
+                        },
+                        {
+                          label: "ARR comprometido",
+                          value: formatEur((billing as any).arrCommitted ?? billing.arr),
+                          sub: `ARR real: ${formatEur(billing.arr)}`,
+                          icon: <DollarSign size={18} />,
+                          color: "#8b5cf6",
+                        },
+                        {
+                          label: "Churn rate",
+                          value: `${billing.churnRate}%`,
+                          sub: `${billing.canceledSubscriptions} canceladas total`,
+                          icon: <TrendingDown size={18} />,
+                          color: "#ef4444",
+                        },
+                      ].map((card) => (
+                        <div
+                          key={card.label}
+                          className="rounded-xl p-4 border"
+                          style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                        >
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-xs text-gray-400">{card.label}</p>
+                            <div
+                              className="w-7 h-7 rounded-lg flex items-center justify-center"
+                              style={{ backgroundColor: card.color + "20", color: card.color }}
+                            >
+                              {card.icon}
+                            </div>
+                          </div>
+                          <p className="text-2xl font-bold text-white">{card.value}</p>
+                          <p className="text-xs text-gray-500 mt-1">{card.sub}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* ── SUBSCRIPTION BREAKDOWN ── */}
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Suscripciones</p>
+                    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
+                      {[
+                        { label: "Pagando recurrente",  value: (billing as any).payingSubscriptions ?? 0,  color: "#10b981", icon: <CreditCard size={18} />, sub: "Plan monthly/annual" },
+                        { label: "En trial (24h)",      value: billing.trialingSubscriptions,  color: "#E63946", icon: <Zap size={18} />, sub: "Convertirán en 24h" },
+                        { label: "Cobro fallido",       value: (billing as any).pastDueSubscriptions ?? 0, color: "#ef4444", icon: <RotateCcw size={18} />, sub: "Pendiente reintento" },
+                        { label: "Por cancelar",        value: billing.subsAboutToCancel,      color: "#f59e0b", icon: <AlertTriangle size={18} />, sub: "Cancel at period end" },
+                        { label: "Canceladas total",    value: billing.canceledSubscriptions,  color: "#ef4444", icon: <UserX size={18} /> },
+                      ].map((card) => (
+                        <div
+                          key={card.label}
+                          className="rounded-xl p-4 border"
+                          style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                        >
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-xs text-gray-400">{card.label}</p>
+                            <div
+                              className="w-7 h-7 rounded-lg flex items-center justify-center"
+                              style={{ backgroundColor: card.color + "20", color: card.color }}
+                            >
+                              {card.icon}
+                            </div>
+                          </div>
+                          <p className="text-2xl font-bold text-white">{card.value}</p>
+                          {card.sub && <p className="text-xs text-gray-500 mt-1">{card.sub}</p>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* ── PERIOD COUNTERS ── */}
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Crecimiento</p>
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                      {[
+                        { label: `Suscripciones (${range.label.toLowerCase()})`, value: billing.newSubsInRange, color: "#10b981" },
+                        { label: `Usuarios (${range.label.toLowerCase()})`,      value: billing.newUsersInRange, color: "#E63946" },
+                        { label: "Suscripciones hoy",                            value: billing.newSubsToday,  color: "#8b5cf6" },
+                        { label: "Usuarios hoy",                                 value: billing.newUsersToday, color: "#8b5cf6" },
+                        { label: "Suscripciones esta semana",                    value: billing.newSubsWeek,   color: "#94a3b8" },
+                        { label: "Usuarios esta semana",                         value: billing.newUsersWeek,  color: "#94a3b8" },
+                        { label: "Suscripciones este mes",                       value: billing.newSubsMonth,  color: "#94a3b8" },
+                        { label: "Usuarios este mes",                            value: billing.newUsersMonth, color: "#94a3b8" },
+                      ].map((s) => (
+                        <div
+                          key={s.label}
+                          className="rounded-xl p-4 border"
+                          style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                        >
+                          <p className="text-xs text-gray-400 mb-1">{s.label}</p>
+                          <p className="text-2xl font-bold" style={{ color: s.color }}>{s.value}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* ── ABOUT-TO-CANCEL TABLE ── */}
+                  <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle size={14} className="text-amber-500" />
+                        <p className="text-sm font-semibold text-white">Suscripciones que se van a cancelar</p>
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        {subsAboutToCancelQ.data?.length ?? 0} en cola
+                      </p>
+                    </div>
+                    {subsAboutToCancelQ.data && subsAboutToCancelQ.data.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead style={{ backgroundColor: "#0a0d14" }}>
+                            <tr className="text-left text-gray-400">
+                              <th className="px-4 py-2 font-medium">Email</th>
+                              <th className="px-4 py-2 font-medium">Plan</th>
+                              <th className="px-4 py-2 font-medium">Estado</th>
+                              <th className="px-4 py-2 font-medium">Fin del periodo</th>
+                              <th className="px-4 py-2 font-medium">País</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {subsAboutToCancelQ.data.map((s: any) => (
+                              <tr key={s.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                                <td className="px-4 py-2 text-white">{s.email}</td>
+                                <td className="px-4 py-2 text-gray-300">{s.plan}</td>
+                                <td className="px-4 py-2">
+                                  <span className="inline-flex px-2 py-0.5 rounded text-[10px] font-semibold"
+                                    style={{ backgroundColor: s.status === "trialing" ? "#E6394620" : "#10b98120", color: s.status === "trialing" ? "#60a5fa" : "#10b981" }}>
+                                    {s.status}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-2 text-gray-300">
+                                  {s.currentPeriodEnd ? new Date(s.currentPeriodEnd).toLocaleDateString("es-ES") : "—"}
+                                </td>
+                                <td className="px-4 py-2 text-gray-400">{s.country ?? "—"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="px-5 py-6 text-center text-xs text-gray-500">
+                        Ningún cliente con cancelación programada — buena señal.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* ── ORPHAN FASTPAY PAYMENTS ── */}
+                  {/* Sipay charged the customer but the redirect to our callback
+                      never fired. Either click "Reconciliar" per row or wait
+                      for the cron at /api/cron/sipay-finalize-pending to do it. */}
+                  <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle size={14} className="text-orange-500" />
+                        <p className="text-sm font-semibold text-white">Pagos huérfanos — Sipay cobró pero el callback no llegó</p>
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        {pendingOrphansQ.data?.length ?? 0} {pendingOrphansQ.data?.length === 1 ? "pago" : "pagos"} pendiente(s)
+                      </p>
+                    </div>
+                    {pendingOrphansQ.isLoading ? (
+                      <div className="flex items-center justify-center h-16">
+                        <div className="w-5 h-5 border-2 border-orange-500 border-t-transparent rounded-full animate-spin" />
+                      </div>
+                    ) : pendingOrphansQ.data && pendingOrphansQ.data.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead style={{ backgroundColor: "#0a0d14" }}>
+                            <tr className="text-left text-gray-400">
+                              <th className="px-4 py-2 font-medium">UserID</th>
+                              <th className="px-4 py-2 font-medium">Order</th>
+                              <th className="px-4 py-2 font-medium">Request ID</th>
+                              <th className="px-4 py-2 font-medium">Importe</th>
+                              <th className="px-4 py-2 font-medium">Iniciado</th>
+                              <th className="px-4 py-2 font-medium">Acciones</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pendingOrphansQ.data.map((o: any) => (
+                              <tr key={`${o.requestId}-${o.userId}`} className="border-t" style={{ borderColor: "#1e2433" }}>
+                                <td className="px-4 py-2 text-gray-300 font-mono">{o.userId}</td>
+                                <td className="px-4 py-2 text-gray-400 font-mono text-[10px]">{o.order}</td>
+                                <td className="px-4 py-2 text-gray-400 font-mono text-[10px]">{o.requestId}</td>
+                                <td className="px-4 py-2 text-gray-300">{(o.amountCents / 100).toFixed(2)} €</td>
+                                <td className="px-4 py-2 text-gray-400 text-[10px]">
+                                  {o.receivedAt ? new Date(o.receivedAt).toLocaleString("es-ES") : "—"}
+                                </td>
+                                <td className="px-4 py-2">
+                                  <button
+                                    onClick={() => recoverOrphanMut.mutate({ requestId: o.requestId, userId: o.userId })}
+                                    disabled={recoverOrphanMut.isPending}
+                                    className="px-2 py-1 rounded text-[10px] font-semibold text-white disabled:opacity-50"
+                                    style={{ backgroundColor: "#E63946" }}
+                                    title="Re-confirmar con Sipay y crear la suscripción"
+                                  >
+                                    {recoverOrphanMut.isPending ? "..." : "Reconciliar"}
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="px-5 py-6 text-center text-xs text-gray-500">
+                        Ningún pago huérfano pendiente — el cron está al día.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* ── PAST-DUE (failed recurring charge) TABLE ── */}
+                  <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                      <div className="flex items-center gap-2">
+                        <RotateCcw size={14} className="text-red-500" />
+                        <p className="text-sm font-semibold text-white">Cobro fallido — pendientes de reintento</p>
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        {pastDueSubsQ.data?.length ?? 0} {pastDueSubsQ.data?.length === 1 ? "cliente" : "clientes"}
+                      </p>
+                    </div>
+                    {pastDueSubsQ.data && pastDueSubsQ.data.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead style={{ backgroundColor: "#0a0d14" }}>
+                            <tr className="text-left text-gray-400">
+                              <th className="px-4 py-2 font-medium">Email</th>
+                              <th className="px-4 py-2 font-medium">Plan</th>
+                              <th className="px-4 py-2 font-medium">Importe</th>
+                              <th className="px-4 py-2 font-medium">Motivo del rechazo</th>
+                              <th className="px-4 py-2 font-medium">Intentos</th>
+                              <th className="px-4 py-2 font-medium">Próximo intento</th>
+                              <th className="px-4 py-2 font-medium">País</th>
+                              <th className="px-4 py-2 font-medium">Provider</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pastDueSubsQ.data.map((s: any) => (
+                              <tr key={s.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                                <td className="px-4 py-2 text-white">{s.email}</td>
+                                <td className="px-4 py-2 text-gray-300">{s.plan}</td>
+                                <td className="px-4 py-2 text-gray-300">
+                                  {typeof s.amountDueEur === "number" ? formatEur(s.amountDueEur) : "—"}
+                                </td>
+                                <td className="px-4 py-2">
+                                  {s.declineCode ? (
+                                    <div>
+                                      <span className="inline-block px-2 py-0.5 rounded text-[10px] font-mono mr-1" style={{ backgroundColor: "#ef444420", color: "#ef4444" }}>
+                                        {s.declineCode}
+                                      </span>
+                                      {s.declineMessage && (
+                                        <span className="text-gray-400 text-[11px]">{s.declineMessage}</span>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-gray-500">—</span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2 text-gray-300">{s.attemptCount ?? 0}</td>
+                                <td className="px-4 py-2 text-gray-400">
+                                  {s.nextAttemptAt ? new Date(s.nextAttemptAt).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" }) : "—"}
+                                </td>
+                                <td className="px-4 py-2 text-gray-400">{s.country ?? "—"}</td>
+                                <td className="px-4 py-2 text-gray-400 font-mono text-xs">
+                                  {(s as any).sipayMaskedCard || "—"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <p className="px-5 py-3 text-[11px] text-gray-500 border-t" style={{ borderColor: "#1e2433" }}>
+                          Sipay no reintenta automáticamente. Nuestro cron MIT-R hace 1 intento por ciclo: si falla, la sub queda en past_due hasta el siguiente ciclo. Si fallan varios seguidos, considera contactar al cliente.
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="px-5 py-6 text-center text-xs text-gray-500">
+                        Ningún cobro fallido — todos los pagos recurrentes al día.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* ── TRIALS CREATED IN LAST 24H WITHOUT A SUCCESSFUL PAYMENT ── */}
+                  <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                      <div className="flex items-center gap-2">
+                        <span className="text-amber-500">⚠</span>
+                        <p className="text-sm font-semibold text-white">Suscripciones recientes sin cobro confirmado (últimas 24h)</p>
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        {recentSubsNoPayQ.data?.filter((s: any) => s.isSuspicious).length ?? 0} sospechosas · {recentSubsNoPayQ.data?.length ?? 0} total
+                      </p>
+                    </div>
+                    {recentSubsNoPayQ.isLoading ? (
+                      <div className="flex items-center justify-center h-24">
+                        <div className="w-5 h-5 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+                      </div>
+                    ) : recentSubsNoPayQ.data && recentSubsNoPayQ.data.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead style={{ backgroundColor: "#0a0d14" }}>
+                            <tr className="text-left text-gray-400">
+                              <th className="px-4 py-2 font-medium">Email</th>
+                              <th className="px-4 py-2 font-medium">Plan</th>
+                              <th className="px-4 py-2 font-medium">Creada</th>
+                              <th className="px-4 py-2 font-medium">Invoice</th>
+                              <th className="px-4 py-2 font-medium">PaymentIntent</th>
+                              <th className="px-4 py-2 font-medium">Motivo</th>
+                              <th className="px-4 py-2 font-medium">Provider</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {recentSubsNoPayQ.data.map((s: any) => (
+                              <tr key={s.id} className="border-t" style={{ borderColor: "#1e2433", backgroundColor: s.isSuspicious ? "#3a1d1d20" : "transparent" }}>
+                                <td className="px-4 py-2 text-white">
+                                  {s.isSuspicious && <span className="mr-1 text-amber-500">⚠</span>}
+                                  {s.email}
+                                </td>
+                                <td className="px-4 py-2 text-gray-300">{s.plan}</td>
+                                <td className="px-4 py-2 text-gray-400">
+                                  {s.createdAt ? new Date(s.createdAt).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" }) : "—"}
+                                </td>
+                                <td className="px-4 py-2">
+                                  {s.invoiceStatus ? (
+                                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-mono" style={{
+                                      backgroundColor: s.invoiceStatus === "paid" ? "#10b98120" : s.invoiceStatus === "open" ? "#f59e0b20" : "#6b728020",
+                                      color: s.invoiceStatus === "paid" ? "#10b981" : s.invoiceStatus === "open" ? "#f59e0b" : "#9ca3af",
+                                    }}>
+                                      {s.invoiceStatus}
+                                    </span>
+                                  ) : <span className="text-gray-500">—</span>}
+                                </td>
+                                <td className="px-4 py-2">
+                                  {s.paymentIntentStatus ? (
+                                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-mono" style={{
+                                      backgroundColor: s.paymentIntentStatus === "succeeded" ? "#10b98120" : "#ef444420",
+                                      color: s.paymentIntentStatus === "succeeded" ? "#10b981" : "#ef4444",
+                                    }}>
+                                      {s.paymentIntentStatus}
+                                    </span>
+                                  ) : <span className="text-gray-500">—</span>}
+                                </td>
+                                <td className="px-4 py-2 text-gray-400 max-w-xs">
+                                  {s.declineCode ? (
+                                    <div>
+                                      <span className="inline-block px-2 py-0.5 rounded text-[10px] font-mono mr-1" style={{ backgroundColor: "#ef444420", color: "#ef4444" }}>
+                                        {s.declineCode}
+                                      </span>
+                                      {s.declineMessage && (
+                                        <div className="text-[11px] mt-0.5">{s.declineMessage}</div>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-gray-500">—</span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2 text-gray-400 font-mono text-xs">
+                                  {(s as any).sipayMaskedCard || "—"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <p className="px-5 py-3 text-[11px] text-gray-500 border-t" style={{ borderColor: "#1e2433" }}>
+                          Invoice <span className="text-amber-500">open</span> = factura emitida sin cobrar (típico: usuario abandonó en 3DS). Invoice <span className="text-green-500">paid</span> = OK. PaymentIntent <span className="text-red-500">requires_action</span> = esperando confirmación del cliente.
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="px-5 py-6 text-center text-xs text-gray-500">
+                        Ninguna suscripción reciente — ningún cobro sospechoso.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* ── RECENT CHARGES + REFUND ── */}
+                  <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                      <div className="flex items-center gap-2">
+                        <CreditCard size={14} className="text-gray-400" />
+                        <p className="text-sm font-semibold text-white">Últimos cobros (reembolso en 1 click)</p>
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        {chargesQ.data?.length ?? 0} cobros
+                      </p>
+                    </div>
+                    {chargesQ.isLoading ? (
+                      <div className="flex items-center justify-center h-24">
+                        <div className="w-5 h-5 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
+                      </div>
+                    ) : chargesQ.data && chargesQ.data.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead style={{ backgroundColor: "#0a0d14" }}>
+                            <tr className="text-left text-gray-400">
+                              <th className="px-4 py-2 font-medium">Fecha</th>
+                              <th className="px-4 py-2 font-medium">Cliente</th>
+                              <th className="px-4 py-2 font-medium text-right">Importe</th>
+                              <th className="px-4 py-2 font-medium text-right">Reembolsado</th>
+                              <th className="px-4 py-2 font-medium">Charge ID</th>
+                              <th className="px-4 py-2 font-medium">Acción</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {chargesQ.data.map((c: any) => {
+                              const remaining = c.amountEur - c.refundedEur;
+                              return (
+                                <tr key={c.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                                  <td className="px-4 py-2 text-gray-300">
+                                    {new Date(c.created).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" })}
+                                  </td>
+                                  <td className="px-4 py-2 text-white">{c.customerEmail ?? "—"}</td>
+                                  <td className="px-4 py-2 text-right text-gray-100 font-mono">{formatEur(c.amountEur)}</td>
+                                  <td className="px-4 py-2 text-right">
+                                    {c.refundedEur > 0 ? (
+                                      <span className="text-amber-400 font-mono">{formatEur(c.refundedEur)}</span>
+                                    ) : (
+                                      <span className="text-gray-600">—</span>
+                                    )}
+                                  </td>
+                                  <td className="px-4 py-2 text-[11px] font-mono text-gray-400">
+                                    {((c as any).sipayTransactionId || c.id).slice(0, 20)}…
+                                  </td>
+                                  <td className="px-4 py-2">
+                                    {c.fullyRefunded || remaining <= 0 ? (
+                                      <span className="text-[10px] text-gray-500">Reembolsado</span>
+                                    ) : (
+                                      <button
+                                        disabled={refundMut.isPending}
+                                        onClick={() => {
+                                          const msg = `¿Reembolsar ${formatEur(remaining)} al cliente ${c.customerEmail ?? c.id}?\n\nEsto es irreversible.`;
+                                          if (confirm(msg)) {
+                                            refundMut.mutate({ chargeId: c.id, reason: "requested_by_customer" });
+                                          }
+                                        }}
+                                        className="px-2.5 py-1 rounded-md text-[11px] font-semibold text-white transition-colors disabled:opacity-50"
+                                        style={{ backgroundColor: "#E63946" }}
+                                      >
+                                        Reembolsar
+                                      </button>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="px-5 py-6 text-center text-xs text-gray-500">
+                        Sin cobros recientes.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* ── GEO DISTRIBUTION (A4) ── */}
+                  {geoQ.data && geoQ.data.length > 0 && (
+                    <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                      <div className="px-5 py-3 border-b" style={{ borderColor: "#1e2433" }}>
+                        <p className="text-sm font-semibold text-white">MRR por país</p>
+                        <p className="text-[11px] text-gray-500 mt-0.5">Solo suscripciones activas + trials (proyectados al precio actual).</p>
+                      </div>
+                      <div className="p-5 space-y-2">
+                        {(() => {
+                          const max = Math.max(...geoQ.data.map((g: any) => g.mrrEur), 0.01);
+                          return geoQ.data.slice(0, 12).map((g: any) => {
+                            const pct = (g.mrrEur / max) * 100;
+                            return (
+                              <div key={g.country} className="flex items-center gap-3">
+                                <div className="w-28 text-xs text-gray-300 truncate">{g.country}</div>
+                                <div className="flex-1 h-5 rounded" style={{ backgroundColor: "#0a0d14" }}>
+                                  <div
+                                    className="h-full rounded transition-all"
+                                    style={{
+                                      width: `${pct}%`,
+                                      background: "linear-gradient(90deg, #E63946, #E63946)",
+                                    }}
+                                  />
+                                </div>
+                                <div className="w-16 text-right text-xs text-gray-200 font-mono">
+                                  {formatEur(g.mrrEur)}
+                                </div>
+                                <div className="w-10 text-right text-[10px] text-gray-500">
+                                  {g.subs} sub{g.subs !== 1 ? "s" : ""}
+                                </div>
+                              </div>
+                            );
+                          });
+                        })()}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── CANCELLATION REASONS (F4) ── */}
+                  {cancelReasonsQ.data && cancelReasonsQ.data.length > 0 && (
+                    <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                      <div className="px-5 py-3 border-b" style={{ borderColor: "#1e2433" }}>
+                        <p className="text-sm font-semibold text-white">Motivos de cancelación</p>
+                        <p className="text-[11px] text-gray-500 mt-0.5">Agregado de motivos reportados por usuarios que cancelaron.</p>
+                      </div>
+                      <div className="p-5 grid grid-cols-2 md:grid-cols-4 gap-3">
+                        {cancelReasonsQ.data.map((r: any) => {
+                          const label: Record<string, string> = {
+                            too_expensive: "Demasiado caro",
+                            not_using: "No lo uso",
+                            missing_feature: "Falta función",
+                            bug_or_issue: "Bug / problema",
+                            switched_tool: "Cambié de herramienta",
+                            temporary: "Temporal",
+                            other: "Otro",
+                            unknown: "Sin motivo",
+                          };
+                          return (
+                            <div key={r.reason} className="rounded-lg p-3" style={{ backgroundColor: "#0a0d14" }}>
+                              <p className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">{label[r.reason] ?? r.reason}</p>
+                              <p className="text-xl font-bold text-white">{r.count}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Revenue chart */}
+                  <div
+                    className="rounded-xl p-5 border"
+                    style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                  >
+                    <p className="text-sm font-semibold text-white mb-4">
+                      Ingresos mensuales (últimos 12 meses)
+                    </p>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <AreaChart data={billing.monthlyRevenue}>
+                        <defs>
+                          <linearGradient id="revGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#E63946" stopOpacity={0.3} />
+                            <stop offset="95%" stopColor="#E63946" stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#1e2433" />
+                        <XAxis dataKey="month" tick={{ fill: "#64748b", fontSize: 11 }} />
+                        <YAxis
+                          tick={{ fill: "#64748b", fontSize: 11 }}
+                          tickFormatter={(v) => `€${v}`}
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: "#1e2433",
+                            border: "1px solid #334155",
+                            borderRadius: "8px",
+                            color: "#e2e8f0",
+                          }}
+                          formatter={(v: number) => [`€${v.toFixed(2)}`, "Ingresos"]}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="revenue"
+                          stroke="#E63946"
+                          fill="url(#revGrad)"
+                          strokeWidth={2}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* Subscriptions chart */}
+                  <div
+                    className="rounded-xl p-5 border"
+                    style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                  >
+                    <p className="text-sm font-semibold text-white mb-4">
+                      Nuevas suscripciones por mes
+                    </p>
+                    <ResponsiveContainer width="100%" height={180}>
+                      <BarChart data={billing.monthlyRevenue}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#1e2433" />
+                        <XAxis dataKey="month" tick={{ fill: "#64748b", fontSize: 11 }} />
+                        <YAxis tick={{ fill: "#64748b", fontSize: 11 }} />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: "#1e2433",
+                            border: "1px solid #334155",
+                            borderRadius: "8px",
+                            color: "#e2e8f0",
+                          }}
+                        />
+                        <Bar dataKey="subs" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </>
+              ) : (
+                <p className="text-gray-400">No hay datos disponibles</p>
+              )}
+            </div>
+          )}
+
+          {/* ── SUBSCRIBERS (historic + current) ── */}
+          {tab === "subscribers" && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-white">Suscriptores</h2>
+                <button
+                  onClick={() => {
+                    if (!subscribersQ.data?.length) return;
+                    downloadCsv(
+                      subscribersQ.data.map((s: any) => ({
+                        email: s.email,
+                        name: s.name,
+                        plan: s.plan,
+                        status: s.subStatus,
+                        country: s.country,
+                        currentPeriodEnd: s.currentPeriodEnd,
+                        createdAt: s.createdAt,
+                        lastSignedIn: s.lastSignedIn,
+                        sipayMaskedCard: (s as any).sipayMaskedCard,
+                      })),
+                      `subscribers-${new Date().toISOString().slice(0, 10)}.csv`
+                    );
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-white"
+                  style={{ backgroundColor: "#1e2433" }}
+                >
+                  Exportar CSV
+                </button>
+              </div>
+              {subscribersQ.isLoading ? (
+                <div className="flex items-center justify-center h-32">
+                  <div className="w-6 h-6 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
+                </div>
+              ) : (
+                <div className="rounded-xl border overflow-x-auto" style={{ borderColor: "#1e2433" }}>
+                  <table className="w-full text-xs">
+                    <thead style={{ backgroundColor: "#0a0d14" }}>
+                      <tr className="text-left text-gray-400">
+                        <th className="px-4 py-2 font-medium">Email</th>
+                        <th className="px-4 py-2 font-medium">Nombre</th>
+                        <th className="px-4 py-2 font-medium">Plan</th>
+                        <th className="px-4 py-2 font-medium">Estado</th>
+                        <th className="px-4 py-2 font-medium">Próximo cobro</th>
+                        <th className="px-4 py-2 font-medium">Último cargo</th>
+                        <th className="px-4 py-2 font-medium">País</th>
+                        <th className="px-4 py-2 font-medium">Tarjeta</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {subscribersQ.data?.map((s: any) => (
+                        <tr key={s.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                          <td className="px-4 py-2 text-white">{s.email}</td>
+                          <td className="px-4 py-2 text-gray-300">{s.name || "—"}</td>
+                          <td className="px-4 py-2 text-gray-300">{s.plan}</td>
+                          <td className="px-4 py-2">
+                            <div className="flex flex-col gap-1">
+                              <span
+                                className="inline-flex px-2 py-0.5 rounded text-[10px] font-semibold w-fit"
+                                style={{
+                                  backgroundColor:
+                                    s.subStatus === "active" ? "#10b98120" :
+                                    s.subStatus === "trialing" ? "#E6394620" :
+                                    s.subStatus === "past_due" ? "#ef444420" :
+                                    s.subStatus === "canceled" ? "#6b728020" : "#6b728020",
+                                  color:
+                                    s.subStatus === "active" ? "#10b981" :
+                                    s.subStatus === "trialing" ? "#60a5fa" :
+                                    s.subStatus === "past_due" ? "#ef4444" :
+                                    "#9ca3af",
+                                }}
+                              >
+                                {s.subStatus}
+                              </span>
+                              {(s as any).cancelAtPeriodEnd && (
+                                <span
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold w-fit"
+                                  style={{ backgroundColor: "#f59e0b20", color: "#fbbf24" }}
+                                  title="El usuario canceló — no se renueva al final del periodo"
+                                >
+                                  ⚠ cancela {s.currentPeriodEnd ? new Date(s.currentPeriodEnd).toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit" }) : ""}
+                                </span>
+                              )}
+                              {!(s as any).sipayToken && (
+                                <span
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold w-fit"
+                                  style={{ backgroundColor: "#dc262620", color: "#f87171" }}
+                                  title="Sin token de Sipay — no se podrá renovar (recuperación manual de huérfana)"
+                                >
+                                  ⚠ sin renovación
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-4 py-2 text-gray-300">
+                            {s.currentPeriodEnd ? new Date(s.currentPeriodEnd).toLocaleDateString("es-ES") : "—"}
+                          </td>
+                          <td className="px-4 py-2">
+                            {s.lastCharge ? (
+                              <div className="flex flex-col">
+                                <span className="text-gray-200">
+                                  {(s.lastCharge.amountCents / 100).toFixed(2).replace(".", ",")} € ·{" "}
+                                  <span style={{ color: s.lastCharge.status === "ok" ? "#10b981" : s.lastCharge.status === "refunded" ? "#fbbf24" : "#f87171" }}>
+                                    {s.lastCharge.status === "ok" ? "cobrado" : s.lastCharge.status === "refunded" ? "reembolsado" : "fallido"}
+                                  </span>
+                                </span>
+                                <span className="text-gray-500 text-[10px]">
+                                  {s.lastCharge.provider} · {s.lastCharge.createdAt ? new Date(s.lastCharge.createdAt).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : ""}
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="text-gray-500">— sin cargo</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-gray-400">{s.country ?? "—"}</td>
+                          <td className="px-4 py-2 text-gray-400 font-mono text-xs">
+                            {(s as any).sipayMaskedCard || "—"}
+                          </td>
+                        </tr>
+                      ))}
+                      {!subscribersQ.data?.length && (
+                        <tr>
+                          <td colSpan={7} className="px-4 py-6 text-center text-gray-500">
+                            Sin suscriptores todavía.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── DOCUMENTS ── */}
+          {tab === "documents" && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <h2 className="text-lg font-semibold text-white">Documentos</h2>
+                <div className="flex items-center gap-2">
+                  <div className="relative">
+                    <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      placeholder="Buscar por nombre o email..."
+                      value={docSearch}
+                      onChange={(e) => setDocSearch(e.target.value)}
+                      className="pl-8 pr-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+                      style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#131720" }}
+                    />
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (!docsQ.data?.length) return;
+                      downloadCsv(
+                        docsQ.data.map((d: any) => ({
+                          id: d.id,
+                          name: d.name,
+                          user: d.userEmail,
+                          sizeBytes: d.fileSize,
+                          paymentStatus: d.paymentStatus,
+                          createdAt: d.createdAt,
+                        })),
+                        `documents-${new Date().toISOString().slice(0, 10)}.csv`
+                      );
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium text-white"
+                    style={{ backgroundColor: "#1e2433" }}
+                  >
+                    Exportar CSV
+                  </button>
+                </div>
+              </div>
+
+              {/* Storage by user — top 10 */}
+              <div className="rounded-xl border overflow-hidden" style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+                <div className="px-5 py-3 border-b" style={{ borderColor: "#1e2433" }}>
+                  <p className="text-sm font-semibold text-white">Top usuarios por almacenamiento (R2)</p>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead style={{ backgroundColor: "#0a0d14" }}>
+                      <tr className="text-left text-gray-400">
+                        <th className="px-4 py-2 font-medium">Email</th>
+                        <th className="px-4 py-2 font-medium">Nombre</th>
+                        <th className="px-4 py-2 font-medium text-right">Documentos</th>
+                        <th className="px-4 py-2 font-medium text-right">Almacenamiento</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {storageQ.data?.slice(0, 10).map((s: any) => (
+                        <tr key={s.userId} className="border-t" style={{ borderColor: "#1e2433" }}>
+                          <td className="px-4 py-2 text-white">{s.email}</td>
+                          <td className="px-4 py-2 text-gray-300">{s.name || "—"}</td>
+                          <td className="px-4 py-2 text-right text-gray-300">{s.docCount}</td>
+                          <td className="px-4 py-2 text-right text-gray-200 font-mono">
+                            {(() => {
+                              const b = Number(s.totalBytes) || 0;
+                              if (b < 1024) return `${b} B`;
+                              if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+                              if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+                              return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+                            })()}
+                          </td>
+                        </tr>
+                      ))}
+                      {!storageQ.data?.length && (
+                        <tr><td colSpan={4} className="px-4 py-4 text-center text-gray-500">Sin datos</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Documents list */}
+              <div className="rounded-xl border overflow-hidden" style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+                <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+                  <p className="text-sm font-semibold text-white">Últimos documentos</p>
+                  <p className="text-xs text-gray-500">
+                    {docsQ.data?.length ?? 0} resultados
+                  </p>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead style={{ backgroundColor: "#0a0d14" }}>
+                      <tr className="text-left text-gray-400">
+                        <th className="px-4 py-2 font-medium">Nombre</th>
+                        <th className="px-4 py-2 font-medium">Usuario</th>
+                        <th className="px-4 py-2 font-medium text-right">Tamaño</th>
+                        <th className="px-4 py-2 font-medium">Pago</th>
+                        <th className="px-4 py-2 font-medium">Fecha</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {docsQ.data?.map((d: any) => (
+                        <tr key={d.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                          <td className="px-4 py-2 text-white truncate max-w-[260px]">{d.name}</td>
+                          <td className="px-4 py-2 text-gray-300">{d.userEmail ?? "—"}</td>
+                          <td className="px-4 py-2 text-right text-gray-200 font-mono">
+                            {(() => {
+                              const b = d.fileSize || 0;
+                              if (b < 1024) return `${b} B`;
+                              if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+                              return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+                            })()}
+                          </td>
+                          <td className="px-4 py-2">
+                            <span
+                              className="inline-flex px-2 py-0.5 rounded text-[10px] font-semibold"
+                              style={{
+                                backgroundColor: d.paymentStatus === "paid" ? "#10b98120" : "#f59e0b20",
+                                color: d.paymentStatus === "paid" ? "#10b981" : "#f59e0b",
+                              }}
+                            >
+                              {d.paymentStatus}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 text-gray-400">
+                            {new Date(d.createdAt).toLocaleString("es-ES")}
+                          </td>
+                        </tr>
+                      ))}
+                      {!docsQ.data?.length && (
+                        <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">Sin documentos.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── CONVERSIÓN TRIAL ── */}
+          {tab === "conversion" && <ConversionPanel q={conversionQ} />}
+
+          {/* ── USERS ── */}
+          {tab === "users" && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-white">Gestión de usuarios</h2>
+                <div className="flex items-center gap-2">
+                  <div className="relative">
+                    <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      placeholder="Buscar por email..."
+                      value={userSearch}
+                      onChange={(e) => setUserSearch(e.target.value)}
+                      className="pl-8 pr-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+                      style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#131720" }}
+                    />
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (!usersQ.data?.length) return;
+                      downloadCsv(
+                        usersQ.data.map((u: any) => ({
+                          id: u.id,
+                          name: u.name,
+                          email: u.email,
+                          role: u.role,
+                          country: u.country,
+                          subStatus: u.subStatus,
+                          plan: u.subPlan,
+                          sipayMaskedCard: (u as any).sipayMaskedCard,
+                          currentPeriodEnd: u.currentPeriodEnd,
+                          createdAt: u.createdAt,
+                          lastSignedIn: u.lastSignedIn,
+                        })),
+                        `users-${new Date().toISOString().slice(0, 10)}.csv`
+                      );
+                    }}
+                    className="px-3 py-2 rounded-lg text-xs font-medium text-white"
+                    style={{ backgroundColor: "#1e2433" }}
+                  >
+                    Exportar CSV
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-xl border overflow-x-auto" style={{ borderColor: "#1e2433" }}>
+                <table className="w-full text-sm min-w-[1300px]">
+                  <thead>
+                    <tr style={{ backgroundColor: "#0a0d14" }}>
+                      {["ID", "Nombre", "Email", "Rol", "Suscripción", "Plan", "ID Pago", "Vence", "Registro", "Último acceso", "Acciones"].map((h) => (
+                        <th key={h} className="px-4 py-3 text-left text-xs font-medium text-gray-400 whitespace-nowrap">
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {usersQ.isLoading ? (
+                      <tr>
+                        <td colSpan={11} className="px-4 py-8 text-center text-gray-400">
+                          Cargando...
+                        </td>
+                      </tr>
+                    ) : (usersQ.data ?? []).map((u, i) => (
+                      <tr
+                        key={u.id}
+                        style={{
+                          backgroundColor: i % 2 === 0 ? "#131720" : "#0f1117",
+                          borderTop: "1px solid #1e2433",
+                        }}
+                      >
+                        <td className="px-4 py-3 text-gray-400 text-xs">{u.id}</td>
+                        <td className="px-4 py-3 text-white font-medium">{u.name ?? "\u2014"}</td>
+                        <td className="px-4 py-3 text-gray-300">{u.email ?? "\u2014"}</td>
+                        <td className="px-4 py-3">
+                          <span
+                            className="px-2 py-0.5 rounded text-xs font-medium"
+                            style={{
+                              backgroundColor: u.role === "admin" ? "#7c3aed20" : "#1e2433",
+                              color: u.role === "admin" ? "#a78bfa" : "#94a3b8",
+                            }}
+                          >
+                            {u.role}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          {u.subStatus ? (<>
+                            <span
+                              className="px-2 py-0.5 rounded text-xs font-medium whitespace-nowrap"
+                              style={{
+                                backgroundColor:
+                                  u.subStatus === "active" || u.subStatus === "trialing" ? "#10b98120" :
+                                  u.subStatus === "canceled" ? "#ef444420" :
+                                  u.subStatus === "past_due" ? "#f59e0b20" :
+                                  u.subStatus === "incomplete" ? "#6366f120" : "#1e2433",
+                                color:
+                                  u.subStatus === "active" || u.subStatus === "trialing" ? "#34d399" :
+                                  u.subStatus === "canceled" ? "#f87171" :
+                                  u.subStatus === "past_due" ? "#fbbf24" :
+                                  u.subStatus === "incomplete" ? "#a5b4fc" : "#94a3b8",
+                              }}
+                            >
+                              {u.subStatus === "active" ? "\u2705 Activa" :
+                               u.subStatus === "trialing" ? "\u23F3 Trial" :
+                               u.subStatus === "canceled" ? "\u274C Cancelada" :
+                               u.subStatus === "past_due" ? "\u26A0\uFE0F Impago" :
+                               u.subStatus === "incomplete" ? "\u23F3 Incompleta" : u.subStatus}
+                            </span>
+                            {(u as any).cancelAtPeriodEnd ? (
+                              <span
+                                className="ml-1 px-2 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap"
+                                style={{ backgroundColor: "#f59e0b20", color: "#fbbf24" }}
+                                title="El usuario cancelo - no se renueva al final del periodo"
+                              >
+                                {"⚠"} cancela {u.currentPeriodEnd ? new Date(u.currentPeriodEnd).toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit" }) : ""}
+                              </span>
+                            ) : null}
+                          </>) : (
+                            <span className="text-xs text-gray-500">Sin suscripci\u00f3n</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs">
+                          {u.subPlan ?? "\u2014"}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-500 font-mono">
+                          {(u as any).sipayMaskedCard ??"\u2014"}
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs whitespace-nowrap">
+                          {u.currentPeriodEnd ? new Date(u.currentPeriodEnd).toLocaleDateString("es-ES") : "\u2014"}
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs">
+                          {new Date(u.createdAt).toLocaleDateString("es-ES")}
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs">
+                          {new Date(u.lastSignedIn).toLocaleDateString("es-ES")}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() =>
+                                promoteUserMut.mutate({
+                                  userId: u.id,
+                                  role: u.role === "admin" ? "user" : "admin",
+                                })
+                              }
+                              title={u.role === "admin" ? "Quitar admin" : "Hacer admin"}
+                              className="p-1.5 rounded transition-colors hover:bg-gray-700"
+                              style={{ color: u.role === "admin" ? "#f59e0b" : "#64748b" }}
+                            >
+                              {u.role === "admin" ? <ShieldOff size={14} /> : <ShieldCheck size={14} />}
+                            </button>
+                            {u.email && (
+                              <a
+                                href={`mailto:${u.email}`}
+                                className="p-1.5 rounded transition-colors hover:bg-gray-700 text-gray-400 hover:text-red-400"
+                              >
+                                <Mail size={14} />
+                              </a>
+                            )}
+                            <button
+                              onClick={() => {
+                                const current = (u as any).adminNotes ?? "";
+                                const next = prompt(`Notas internas para ${u.email}:`, current);
+                                if (next !== null && next !== current) {
+                                  updateNotesMut.mutate({ userId: u.id, notes: next });
+                                }
+                              }}
+                              title={(u as any).adminNotes ? "Notas: " + (u as any).adminNotes : "Añadir notas"}
+                              className="p-1.5 rounded transition-colors hover:bg-gray-700"
+                              style={{ color: (u as any).adminNotes ? "#fbbf24" : "#64748b" }}
+                            >
+                              <StickyNote size={14} />
+                            </button>
+                            <button
+                              onClick={() => setTimelineUserId(u.id)}
+                              title="Ver timeline del usuario"
+                              className="p-1.5 rounded transition-colors hover:bg-gray-700 text-gray-400 hover:text-red-400"
+                            >
+                              <ClipboardList size={14} />
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (confirm(`¿Cancelar la suscripción de ${u.email}?\nDejará de renovar; mantiene acceso hasta fin de periodo.`)) {
+                                  cancelSubMut.mutate({ userId: u.id });
+                                }
+                              }}
+                              title="Cancelar suscripción (no renovará)"
+                              className="p-1.5 rounded transition-colors hover:bg-gray-700 text-gray-400 hover:text-amber-400"
+                            >
+                              <UserX size={14} />
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (confirm(`¿Eliminar usuario ${u.email}?`)) {
+                                  deleteUserMut.mutate({ userId: u.id });
+                                }
+                              }}
+                              title="Eliminar usuario"
+                              className="p-1.5 rounded transition-colors hover:bg-gray-700 text-gray-400 hover:text-red-400"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── CANCELED ── */}
+          {tab === "canceled" && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-white">Usuarios que se han dado de baja</h2>
+                <button
+                  onClick={() => {
+                    if (!canceledQ.data?.length) return;
+                    downloadCsv(
+                      canceledQ.data.map((c: any) => ({
+                        name: c.name,
+                        email: c.email,
+                        plan: c.plan,
+                        canceledAt: c.canceledAt,
+                        country: c.country,
+                        sipayMaskedCard: c.sipayMaskedCard,
+                      })),
+                      `canceled-${new Date().toISOString().slice(0, 10)}.csv`
+                    );
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-white"
+                  style={{ backgroundColor: "#1e2433" }}
+                >
+                  Exportar CSV
+                </button>
+              </div>
+              <div className="rounded-xl border overflow-hidden" style={{ borderColor: "#1e2433" }}>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr style={{ backgroundColor: "#0a0d14" }}>
+                      {["Nombre", "Email", "Plan", "Fecha baja", "País", "ID Pago"].map((h) => (
+                        <th key={h} className="px-4 py-3 text-left text-xs font-medium text-gray-400">
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {canceledQ.isLoading ? (
+                      <tr>
+                        <td colSpan={6} className="px-4 py-8 text-center text-gray-400">
+                          Cargando...
+                        </td>
+                      </tr>
+                    ) : (canceledQ.data ?? []).length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="px-4 py-8 text-center text-gray-400">
+                          No hay bajas registradas
+                        </td>
+                      </tr>
+                    ) : (canceledQ.data ?? []).map((u, i) => (
+                      <tr
+                        key={u.id}
+                        style={{
+                          backgroundColor: i % 2 === 0 ? "#131720" : "#0f1117",
+                          borderTop: "1px solid #1e2433",
+                        }}
+                      >
+                        <td className="px-4 py-3 text-white">{u.name ?? "—"}</td>
+                        <td className="px-4 py-3 text-gray-300">{u.email ?? "—"}</td>
+                        <td className="px-4 py-3">
+                          <span
+                            className="px-2 py-0.5 rounded text-xs font-medium"
+                            style={{ backgroundColor: "#ef444420", color: "#f87171" }}
+                          >
+                            {u.plan}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs">
+                          {u.canceledAt
+                            ? new Date(u.canceledAt).toLocaleDateString("es-ES")
+                            : "—"}
+                        </td>
+                        <td className="px-4 py-3 text-gray-400">{u.country ?? "—"}</td>
+                        <td className="px-4 py-3 text-gray-500 text-xs font-mono">
+                          {(u as any).sipayMaskedCard ??"—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── COUPONS (F7) ── */}
+          {tab === "coupons" && (
+            <CouponsTab
+              couponsQ={couponsQ}
+              createCouponMut={createCouponMut}
+              deleteCouponMut={deleteCouponMut}
+            />
+          )}
+
+          {/* ── MESSAGES ── */}
+          {tab === "messages" && (() => {
+            const allMessages = messagesQ.data ?? [];
+            const visibleMessages = showArchived
+              ? allMessages
+              : allMessages.filter((m) => !(m as any).archivedAt);
+            const archivedCount = allMessages.filter((m) => (m as any).archivedAt).length;
+            const allSelected = visibleMessages.length > 0 && visibleMessages.every((m) => selectedMessages.has(m.id));
+            const toggleSelectAll = () => {
+              if (allSelected) {
+                setSelectedMessages(new Set());
+              } else {
+                setSelectedMessages(new Set(visibleMessages.map((m) => m.id)));
+              }
+            };
+            const toggleOne = (id: number) => {
+              setSelectedMessages((prev) => {
+                const next = new Set(prev);
+                if (next.has(id)) next.delete(id);
+                else next.add(id);
+                return next;
+              });
+            };
+            const selectedIds = Array.from(selectedMessages);
+            const selectedAreAllArchived = selectedIds.length > 0 && selectedIds.every((id) => {
+              const m = allMessages.find((mm) => mm.id === id);
+              return m && (m as any).archivedAt;
+            });
+            return (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <h2 className="text-lg font-semibold text-white">
+                  Mensajes de contacto
+                  <span className="text-xs text-gray-500 font-normal ml-2">
+                    {visibleMessages.length} {showArchived ? "totales" : "activos"}
+                    {!showArchived && archivedCount > 0 && ` · ${archivedCount} archivados ocultos`}
+                  </span>
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setShowArchived((v) => !v)}
+                  className="text-xs px-3 py-1.5 rounded-lg border transition-colors"
+                  style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: showArchived ? "#1e2433" : "transparent" }}
+                >
+                  {showArchived ? "Ocultar archivados" : "Mostrar archivados"}
+                </button>
+              </div>
+
+              {/* Bulk action bar — only visible when something is selected */}
+              {selectedMessages.size > 0 && (
+                <div
+                  className="rounded-xl border p-3 flex items-center justify-between gap-3 flex-wrap sticky top-0 z-10"
+                  style={{ backgroundColor: "#1a1f2e", borderColor: "#E63946" }}
+                >
+                  <p className="text-sm text-white font-medium">
+                    {selectedMessages.size} seleccionado{selectedMessages.size !== 1 ? "s" : ""}
+                  </p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedMessages(new Set())}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-300"
+                      style={{ backgroundColor: "#1e2433" }}
+                    >
+                      Limpiar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => bulkArchiveMut.mutate({ ids: selectedIds, archived: !selectedAreAllArchived })}
+                      disabled={bulkArchiveMut.isPending}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
+                      style={{ backgroundColor: "#0f766e" }}
+                    >
+                      {selectedAreAllArchived ? "Desarchivar" : "Archivar"} ({selectedIds.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (confirm(`¿Borrar ${selectedIds.length} mensaje(s)?\nEsta acción no se puede deshacer.`)) {
+                          bulkDeleteMut.mutate({ ids: selectedIds });
+                        }
+                      }}
+                      disabled={bulkDeleteMut.isPending}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
+                      style={{ backgroundColor: "#dc2626" }}
+                    >
+                      Borrar ({selectedIds.length})
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Select-all checkbox row */}
+              {visibleMessages.length > 0 && (
+                <label className="flex items-center gap-2 px-2 py-1 cursor-pointer text-xs text-gray-400 hover:text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    onChange={toggleSelectAll}
+                    className="w-3.5 h-3.5 accent-[#E63946]"
+                  />
+                  Seleccionar todos los {showArchived ? "" : "activos "}({visibleMessages.length})
+                </label>
+              )}
+
+              {messagesQ.isLoading ? (
+                <p className="text-gray-400">Cargando...</p>
+              ) : visibleMessages.length === 0 ? (
+                <p className="text-gray-400">{showArchived && archivedCount === 0 ? "No hay mensajes" : "No hay mensajes activos"}</p>
+              ) : (
+                <div className="space-y-2">
+                  {visibleMessages.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className="rounded-xl border-l-4 border-y border-r p-4 cursor-pointer transition-colors"
+                      style={{
+                        backgroundColor: !msg.read ? "#172037" : (msg as any).repliedAt ? "#0f1c14" : "#131720",
+                        borderColor: "#1e2433",
+                        borderLeftColor: !msg.read ? "#3b82f6" : (msg as any).repliedAt ? "#10b981" : "#475569",
+                      }}
+                      onClick={() => {
+                        // Don't collapse when the admin is selecting text (e.g.
+                        // highlighting the message to translate it) — the mouseup
+                        // of a drag-select ends as a click on this card.
+                        if (window.getSelection()?.toString()) return;
+                        setExpandedMsg(expandedMsg === msg.id ? null : msg.id);
+                        if (!msg.read) markReadMut.mutate({ id: msg.id });
+                      }}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          <input
+                            type="checkbox"
+                            checked={selectedMessages.has(msg.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={() => toggleOne(msg.id)}
+                            className="w-3.5 h-3.5 accent-[#E63946] flex-shrink-0"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="text-sm font-medium text-white truncate">
+                                {msg.name}{" "}
+                                <span className="text-gray-400 font-normal">— {msg.email}</span>
+                              </p>
+                              <StatusBadge read={msg.read} repliedAt={(msg as any).repliedAt ?? null} />
+                              {msg.reason && <ReasonBadge reason={msg.reason} />}
+                              {(() => {
+                                const g = detectLanguage(`${msg.subject ?? ""} ${msg.message ?? ""}`);
+                                return g ? (
+                                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap" style={{ backgroundColor: "#1e293b", color: "#cbd5e1" }} title={`Idioma detectado: ${g.name}`}>
+                                    {g.flag} {g.name}
+                                  </span>
+                                ) : null;
+                              })()}
+                              {(messagesByEmail[msg.email.toLowerCase()]?.length ?? 0) > 1 && (
+                                <RecurrentBadge count={messagesByEmail[msg.email.toLowerCase()].length} />
+                              )}
+                              {(msg as any).archivedAt && (
+                                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap" style={{ backgroundColor: "#374151", color: "#9ca3af" }}>
+                                  📁 Archivado
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-gray-400 truncate">{msg.subject}</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <span className="text-xs text-gray-500">
+                            {new Date(msg.createdAt).toLocaleDateString("es-ES")}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (confirm(`¿Borrar el mensaje de ${msg.name}?\nEsta acción no se puede deshacer.`)) {
+                                deleteMessageMut.mutate({ id: msg.id });
+                              }
+                            }}
+                            disabled={deleteMessageMut.isPending}
+                            className="p-1 rounded hover:bg-red-900/30 text-gray-500 hover:text-red-400 transition-colors disabled:opacity-50"
+                            title="Borrar mensaje"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                          {expandedMsg === msg.id ? (
+                            <ChevronUp size={14} className="text-gray-400" />
+                          ) : (
+                            <ChevronDown size={14} className="text-gray-400" />
+                          )}
+                        </div>
+                      </div>
+                      {expandedMsg === msg.id && (
+                        <div className="mt-3 pt-3 border-t" style={{ borderColor: "#1e2433" }}>
+                          {/* Select the text and use the browser's right-click
+                              "Translate selection" — it shows a popup without
+                              mutating the DOM (safe with the app-root notranslate). */}
+                          <p className="text-sm text-gray-300 whitespace-pre-wrap select-text">{msg.message}</p>
+
+                          {/* Prior messages from the same email (oldest first, excluding current). */}
+                          {(() => {
+                            const thread = messagesByEmail[msg.email.toLowerCase()] ?? [];
+                            const prior = thread.filter((m) => m.id !== msg.id);
+                            if (prior.length === 0) return null;
+                            return (
+                              <div className="mt-4 rounded-lg p-3 border" style={{ backgroundColor: "#1a1f2e", borderColor: "#1e2433" }}>
+                                <p className="text-[11px] font-semibold text-purple-300 uppercase tracking-wide mb-2 flex items-center gap-1.5">
+                                  <MessageSquare size={12} />
+                                  Historial: {prior.length} mensaje{prior.length !== 1 ? "s" : ""} previo{prior.length !== 1 ? "s" : ""} de este email
+                                </p>
+                                <div className="space-y-2">
+                                  {prior.map((p) => (
+                                    <div key={p.id} className="rounded p-2 text-xs" style={{ backgroundColor: "#0f1117" }} onClick={(e) => e.stopPropagation()}>
+                                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                        <span className="text-gray-500">{new Date(p.createdAt).toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+                                        <span className="text-gray-300 font-medium">· {p.subject}</span>
+                                        {(p as any).repliedAt && (
+                                          <span className="text-emerald-400 text-[10px] flex items-center gap-1">
+                                            <Check size={10} /> Respondido
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className="text-gray-400 whitespace-pre-wrap line-clamp-2">{p.message}</p>
+                                      {(p as any).replyBody && (
+                                        <div className="mt-1.5 pl-2 border-l-2" style={{ borderColor: "#15532e" }}>
+                                          <p className="text-[10px] font-semibold text-emerald-400 uppercase mb-0.5">Tu respuesta</p>
+                                          <p className="text-gray-400 whitespace-pre-wrap line-clamp-2 text-[11px]">{(p as any).replyBody}</p>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {(msg as any).repliedAt ? (
+                            <div className="mt-4 rounded-lg p-3 border" style={{ backgroundColor: "#0f2a1a", borderColor: "#15532e" }}>
+                              <p className="text-[11px] font-semibold text-emerald-300 uppercase tracking-wide mb-1.5 flex items-center gap-1.5">
+                                <Check size={12} />
+                                Respondido · {new Date((msg as any).repliedAt as string).toLocaleString("es-ES")}
+                              </p>
+                              <p className="text-sm text-gray-200 whitespace-pre-wrap">{(msg as any).replyBody as string}</p>
+                            </div>
+                          ) : (
+                            <div className="mt-4 space-y-2" onClick={(e) => e.stopPropagation()}>
+                              {(emailTemplatesQ.data ?? []).length > 0 && (
+                                <div className="flex items-center gap-2">
+                                  <select
+                                    value=""
+                                    onChange={(e) => {
+                                      const id = Number(e.target.value);
+                                      if (!id) return;
+                                      const tpl = (emailTemplatesQ.data ?? []).find((t) => t.id === id);
+                                      if (tpl) {
+                                        setReplyDraft((prev) => ({ ...prev, [msg.id]: applyTemplate(tpl.body, msg) }));
+                                      }
+                                      e.target.value = "";
+                                    }}
+                                    className="text-xs px-2 py-1.5 rounded-lg border bg-transparent focus:outline-none flex-1"
+                                    style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+                                  >
+                                    <option value="">📋 Insertar plantilla…</option>
+                                    {(emailTemplatesQ.data ?? []).map((tpl) => (
+                                      <option key={tpl.id} value={tpl.id}>{tpl.name}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                              )}
+                              {/* Borrador con los datos reales de ESTE cliente:
+                                  cuándo aceptó, desde qué IP, qué se le cobró y
+                                  cuándo. No envía nada — rellena el textarea. */}
+                              <DraftButton
+                                msgId={msg.id}
+                                onDraft={(texto) => setReplyDraft((prev) => ({ ...prev, [msg.id]: texto }))}
+                              />
+                              <textarea
+                                value={replyDraft[msg.id] ?? ""}
+                                onChange={(e) => setReplyDraft((prev) => ({ ...prev, [msg.id]: e.target.value }))}
+                                placeholder={`Hola ${msg.name}, gracias por escribir…`}
+                                rows={6}
+                                className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-[#E63946]"
+                                style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+                              />
+                              <div className="flex items-center justify-between gap-2">
+                                <p className="text-[10px] text-gray-500">Se enviará desde support@pdfeditoronline.net con Reply-To a {msg.email}.</p>
+                                <button
+                                  onClick={() => {
+                                    const body = (replyDraft[msg.id] ?? "").trim();
+                                    if (!body) { toast.error("Escribe una respuesta"); return; }
+                                    replyMessageMut.mutate({ id: msg.id, body });
+                                  }}
+                                  disabled={replyMessageMut.isPending}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white transition-colors disabled:opacity-60 flex-shrink-0"
+                                  style={{ backgroundColor: "#E63946" }}
+                                >
+                                  {replyMessageMut.isPending ? (
+                                    <><Loader2 size={12} className="animate-spin" /> Enviando…</>
+                                  ) : (
+                                    <><Mail size={12} /> Enviar respuesta</>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* ── Manage email templates ── */}
+              <div className="rounded-xl border" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                <button
+                  type="button"
+                  onClick={() => setShowTemplateManager((v) => !v)}
+                  className="w-full px-5 py-3 flex items-center justify-between text-left"
+                >
+                  <div>
+                    <p className="text-sm font-semibold text-white">Plantillas de email</p>
+                    <p className="text-[11px] text-gray-500 mt-0.5">
+                      Respuestas pre-hechas con variables <code className="font-mono">{"{{name}}"}</code>, <code className="font-mono">{"{{email}}"}</code>, <code className="font-mono">{"{{subject}}"}</code>, <code className="font-mono">{"{{price}}"}</code>.
+                    </p>
+                  </div>
+                  {showTemplateManager ? <ChevronUp size={16} className="text-gray-400" /> : <ChevronDown size={16} className="text-gray-400" />}
+                </button>
+
+                {showTemplateManager && (
+                  <div className="px-5 pb-5 space-y-3 border-t" style={{ borderColor: "#1e2433" }}>
+                    <TemplateForm
+                      onSubmit={(data) => createTemplateMut.mutate(data)}
+                      submitting={createTemplateMut.isPending}
+                    />
+
+                    <div className="space-y-2 pt-3">
+                      {emailTemplatesQ.isLoading ? (
+                        <p className="text-xs text-gray-500">Cargando…</p>
+                      ) : (emailTemplatesQ.data ?? []).length === 0 ? (
+                        <p className="text-xs text-gray-500">No hay plantillas todavía. Crea la primera arriba ↑.</p>
+                      ) : (
+                        (emailTemplatesQ.data ?? []).map((tpl) => (
+                          <TemplateRow
+                            key={tpl.id}
+                            template={tpl}
+                            onUpdate={(data) => updateTemplateMut.mutate({ id: tpl.id, ...data })}
+                            onDelete={() => {
+                              if (confirm(`¿Borrar la plantilla "${tpl.name}"?`)) {
+                                deleteTemplateMut.mutate({ id: tpl.id });
+                              }
+                            }}
+                          />
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+            );
+          })()}
+
+          {/* ── WEBHOOKS (F2) ── */}
+          {tab === "webhooks" && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-semibold text-white">Eventos de Sipay</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Últimos 100 eventos del cron + callbacks. Auto-refresca cada 15s.</p>
+                </div>
+                <button
+                  onClick={() => utils.admin.webhookEvents.invalidate()}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-white inline-flex items-center gap-1.5"
+                  style={{ backgroundColor: "#1e2433" }}
+                >
+                  <RefreshCw size={13} />
+                  Refrescar
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                {[
+                  { label: "Total (100)", value: webhookEventsQ.data?.length ?? 0, color: "#94a3b8" },
+                  { label: "OK", value: webhookEventsQ.data?.filter((e: any) => e.status === "ok").length ?? 0, color: "#10b981" },
+                  { label: "Error", value: webhookEventsQ.data?.filter((e: any) => e.status === "error").length ?? 0, color: "#ef4444" },
+                  { label: "Tipos únicos", value: new Set((webhookEventsQ.data ?? []).map((e: any) => e.eventType)).size, color: "#E63946" },
+                ].map((s) => (
+                  <div key={s.label} className="rounded-xl p-4 border" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <p className="text-xs text-gray-400 mb-1">{s.label}</p>
+                    <p className="text-2xl font-bold" style={{ color: s.color }}>{s.value}</p>
+                  </div>
+                ))}
+              </div>
+
+              {/* ── Funnel de pagos ─────────────────────────────────
+                  Counts how many init_started events vs init_failed vs
+                  intro_charge (the success) we have across providers.
+                  Conversion = charges / starts. Lets the admin spot if
+                  one provider is dropping hard before others. */}
+              {(() => {
+                const evts: any[] = webhookEventsQ.data ?? [];
+                const byProvider = (started: string, failed: string, ok: string) => ({
+                  started: evts.filter((e) => e.eventType === started).length,
+                  failed: evts.filter((e) => e.eventType === failed).length,
+                  ok: evts.filter((e) => e.eventType === ok).length,
+                });
+                const funnel = [
+                  { label: "FastPay (tarjeta)", color: "#1E66C9", ...byProvider("fastpay_init_started", "fastpay_init_failed", "fastpay_intro_charge") },
+                  { label: "Apple Pay",         color: "#000000", ...byProvider("apay_init_started",     "apay_init_failed",     "apay_intro_charge")    },
+                  { label: "Google Pay",        color: "#34A853", ...byProvider("gpay_init_started",     "gpay_init_failed",     "gpay_intro_charge")    },
+                ];
+                return (
+                  <div className="rounded-xl p-5 border" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+                    <p className="text-sm font-semibold text-white mb-1">Funnel de intentos de pago</p>
+                    <p className="text-[11px] text-gray-500 mb-4">Última ventana de 100 eventos. <span className="text-gray-400">started</span> = abrió el flujo, <span className="text-green-400">ok</span> = cargo confirmado, <span className="text-red-400">failed</span> = Sipay rechazó antes del 3DS.</p>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      {funnel.map((f) => {
+                        const conv = f.started > 0 ? Math.round((f.ok / f.started) * 100) : 0;
+                        return (
+                          <div key={f.label} className="rounded-lg p-3 border" style={{ backgroundColor: "#0a0d14", borderColor: "#1e2433" }}>
+                            <div className="flex items-center gap-2 mb-2">
+                              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: f.color }} />
+                              <span className="text-xs font-semibold text-white">{f.label}</span>
+                            </div>
+                            <div className="grid grid-cols-3 gap-1 text-center mb-2">
+                              <div>
+                                <p className="text-[10px] text-gray-500 uppercase tracking-wide">Started</p>
+                                <p className="text-lg font-bold text-gray-300">{f.started}</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] text-gray-500 uppercase tracking-wide">OK</p>
+                                <p className="text-lg font-bold text-green-400">{f.ok}</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] text-gray-500 uppercase tracking-wide">Failed</p>
+                                <p className="text-lg font-bold text-red-400">{f.failed}</p>
+                              </div>
+                            </div>
+                            <p className="text-[10px] text-gray-500 text-center">
+                              Conversión: <span className="text-white font-semibold">{conv}%</span>
+                              {f.started > 0 && f.started > f.ok + f.failed && (
+                                <span className="text-gray-500"> · {f.started - f.ok - f.failed} abandono</span>
+                              )}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              <div className="rounded-xl border overflow-hidden" style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead style={{ backgroundColor: "#0a0d14" }}>
+                      <tr className="text-left text-gray-400">
+                        <th className="px-4 py-2 font-medium">Cuándo</th>
+                        <th className="px-4 py-2 font-medium">Tipo</th>
+                        <th className="px-4 py-2 font-medium">Estado</th>
+                        <th className="px-4 py-2 font-medium text-right">ms</th>
+                        <th className="px-4 py-2 font-medium">Event ID</th>
+                        <th className="px-4 py-2 font-medium">Detalle</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {webhookEventsQ.isLoading ? (
+                        <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">Cargando…</td></tr>
+                      ) : !webhookEventsQ.data?.length ? (
+                        <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">Todavía sin eventos. El próximo webhook que llegue aparecerá aquí.</td></tr>
+                      ) : webhookEventsQ.data.map((e: any) => (
+                        <tr key={e.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                          <td className="px-4 py-2 text-gray-300 whitespace-nowrap">
+                            {new Date(e.receivedAt).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "medium" })}
+                          </td>
+                          <td className="px-4 py-2 text-white font-mono text-[11px]">{e.eventType}</td>
+                          <td className="px-4 py-2">
+                            <span
+                              className="inline-flex px-2 py-0.5 rounded text-[10px] font-semibold"
+                              style={{
+                                backgroundColor: e.status === "ok" ? "#10b98120" : "#ef444420",
+                                color: e.status === "ok" ? "#10b981" : "#ef4444",
+                              }}
+                            >
+                              {e.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 text-right text-gray-300 font-mono">{e.durationMs}</td>
+                          <td className="px-4 py-2 text-gray-400 font-mono text-[10px]">{e.eventId ?? "—"}</td>
+                          <td className="px-4 py-2 text-gray-400 max-w-[320px] truncate" title={e.errorMessage ?? ""}>
+                            {e.errorMessage ?? (e.payload ? "payload OK" : "—")}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── AUDIT LOG (S1) ── */}
+          {tab === "consent" && <ConsentTab />}
+
+          {tab === "audit" && (
+            <div className="space-y-4">
+              <div>
+                <h2 className="text-lg font-semibold text-white">Audit log</h2>
+                <p className="text-xs text-gray-400 mt-0.5">Últimas 100 acciones de admin. Se registra cada refund, promoción de usuario y edición de notas.</p>
+              </div>
+
+              <div className="rounded-xl border overflow-hidden" style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead style={{ backgroundColor: "#0a0d14" }}>
+                      <tr className="text-left text-gray-400">
+                        <th className="px-4 py-2 font-medium">Cuándo</th>
+                        <th className="px-4 py-2 font-medium">Admin</th>
+                        <th className="px-4 py-2 font-medium">Acción</th>
+                        <th className="px-4 py-2 font-medium">Objetivo</th>
+                        <th className="px-4 py-2 font-medium">Metadata</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {auditLogQ.isLoading ? (
+                        <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">Cargando…</td></tr>
+                      ) : !auditLogQ.data?.length ? (
+                        <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">Sin entradas todavía. El log se llena al hacer acciones (refunds, cambios de rol, etc.).</td></tr>
+                      ) : auditLogQ.data.map((e: any) => (
+                        <tr key={e.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                          <td className="px-4 py-2 text-gray-300 whitespace-nowrap">
+                            {new Date(e.createdAt).toLocaleString("es-ES")}
+                          </td>
+                          <td className="px-4 py-2 text-white">{e.adminEmail ?? `#${e.adminId}`}</td>
+                          <td className="px-4 py-2 text-gray-200 font-mono text-[11px]">{e.action}</td>
+                          <td className="px-4 py-2 text-gray-400">
+                            {e.targetType ? `${e.targetType}: ${e.targetId}` : "—"}
+                          </td>
+                          <td className="px-4 py-2 text-gray-500 font-mono text-[10px] max-w-[320px] truncate" title={e.metadata ?? ""}>
+                            {e.metadata ?? "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── LEGAL ── */}
+          {tab === "legal" && (
+            <div className="space-y-4">
+              <h2 className="text-lg font-semibold text-white">Páginas legales</h2>
+              {editingLegal ? (
+                <div
+                  className="rounded-xl border p-5 space-y-4"
+                  style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-white">
+                      Editando:{" "}
+                      <span className="text-red-400">{editingLegal}</span>
+                    </h3>
+                    <button
+                      onClick={() => setEditingLegal(null)}
+                      className="text-xs text-gray-400 hover:text-white"
+                    >
+                      Cancelar
+                    </button>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">Título</label>
+                    <input
+                      type="text"
+                      value={legalTitle}
+                      onChange={(e) => setLegalTitle(e.target.value)}
+                      className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+                      style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">
+                      Contenido (HTML o texto)
+                    </label>
+                    <textarea
+                      value={legalContent}
+                      onChange={(e) => setLegalContent(e.target.value)}
+                      rows={16}
+                      className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600 font-mono resize-y"
+                      style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+                    />
+                  </div>
+                  <button
+                    onClick={() =>
+                      saveLegalMut.mutate({
+                        slug: editingLegal,
+                        title: legalTitle,
+                        content: legalContent,
+                      })
+                    }
+                    disabled={saveLegalMut.isPending}
+                    className="px-4 py-2 rounded-lg text-sm font-semibold text-white transition-colors"
+                    style={{ backgroundColor: "#E63946" }}
+                  >
+                    {saveLegalMut.isPending ? "Guardando..." : "Guardar cambios"}
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-4">
+                  {[
+                    { slug: "terms", title: "Términos de Uso y Contrato" },
+                    { slug: "privacy", title: "Política de privacidad" },
+                    { slug: "cookies", title: "Política de cookies" },
+                    { slug: "legal", title: "Aviso legal" },
+                    { slug: "refund", title: "Política de reembolso" },
+                  ].map((page) => {
+                    const existing = legalQ.data?.find((p) => p.slug === page.slug);
+                    return (
+                      <div
+                        key={page.slug}
+                        className="rounded-xl border p-4 flex items-center justify-between"
+                        style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+                      >
+                        <div>
+                          <p className="text-sm font-medium text-white">{page.title}</p>
+                          <p className="text-xs text-gray-400">
+                            {existing
+                              ? `Actualizado: ${new Date(existing.updatedAt).toLocaleDateString("es-ES")}`
+                              : "Sin contenido"}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => {
+                            setEditingLegal(page.slug);
+                            setLegalTitle(existing?.title ?? page.title);
+                            setLegalContent(existing?.content ?? "");
+                          }}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium text-white transition-colors"
+                          style={{ backgroundColor: "#E63946" }}
+                        >
+                          Editar
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── SETTINGS ── */}
+          {tab === "settings" && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-white">Ajustes del sitio</h2>
+
+              {/* Subscription pricing — A/B test */}
+              <div
+                className="rounded-xl border p-5 space-y-4"
+                style={{ backgroundColor: "#131720", borderColor: "#E63946" }}
+              >
+                <div>
+                  <p className="text-sm font-semibold text-white flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: "#E63946" }} />
+                    Precio de suscripción
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Cambia el precio mensual mostrado en toda la web y el que se cobra a las nuevas suscripciones vía MIT-R.
+                    <strong className="text-amber-300"> Solo afecta a NUEVOS checkouts.</strong> Los suscriptores existentes mantienen su precio actual.
+                  </p>
+                </div>
+                {settingsQ.isLoading ? (
+                  <p className="text-gray-400 text-sm">Cargando...</p>
+                ) : (
+                  <div className="space-y-3">
+                    {[
+                      { key: "subscription_price_eur", label: "Precio mensual (€)", placeholder: "19.95 (deja vacío para usar el default)" },
+                    ].map((setting) => {
+                      const current =
+                        settingsQ.data?.find((s) => s.key === setting.key)?.value ?? "";
+                      return (
+                        <SettingRow
+                          key={setting.key}
+                          label={setting.label}
+                          defaultValue={current}
+                          placeholder={setting.placeholder}
+                          onSave={(value) =>
+                            saveSettingMut.mutate({ key: setting.key, value })
+                          }
+                        />
+                      );
+                    })}
+                  </div>
+                )}
+                <p className="text-[10px] text-gray-500 pt-2 border-t" style={{ borderColor: "#1e2433" }}>
+                  💡 El cambio se aplica inmediatamente al cron MIT-R. Si lo dejas vacío, se usa el precio por defecto (19,95 €). Los suscriptores ya activos siguen al precio que tenían cuando se dieron de alta.
+                </p>
+              </div>
+
+              <SipayProbeCard />
+              <WalletTokenCard />
+              <SipayCheckoutCard />
+
+              {/* Site settings */}
+              <div
+                className="rounded-xl border p-5 space-y-4"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+              >
+                <p className="text-sm font-semibold text-white">Configuración del sitio</p>
+                {settingsQ.isLoading ? (
+                  <p className="text-gray-400 text-sm">Cargando...</p>
+                ) : (
+                  <div className="space-y-3">
+                    {[
+                      { key: "site_name", label: "Nombre del sitio", placeholder: brandName },
+                      { key: "support_email", label: "Email de soporte", placeholder: "soporte@pdfeditoronline.net" },
+                      { key: "trial_price_eur", label: "Precio prueba 24h (€)", placeholder: "0.50" },
+                      { key: "promo_banner_text", label: "Texto del banner promocional", placeholder: "¡Oferta especial! 20% de descuento…" },
+                      { key: "promo_banner_level", label: "Nivel del banner (info / warning / success)", placeholder: "info" },
+                    ].map((setting) => {
+                      const current =
+                        settingsQ.data?.find((s) => s.key === setting.key)?.value ?? "";
+                      return (
+                        <SettingRow
+                          key={setting.key}
+                          label={setting.label}
+                          defaultValue={current}
+                          placeholder={setting.placeholder}
+                          onSave={(value) =>
+                            saveSettingMut.mutate({ key: setting.key, value })
+                          }
+                        />
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Feature flags (O4) — boolean toggles stored in site_settings */}
+              <div
+                className="rounded-xl border p-5 space-y-4"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+              >
+                <div>
+                  <p className="text-sm font-semibold text-white">Feature flags</p>
+                  <p className="text-xs text-gray-500 mt-0.5">Activa o desactiva funcionalidades sin necesidad de re-desplegar.</p>
+                </div>
+                <div className="space-y-2">
+                  {[
+                    { key: "flag_converter_enabled", label: "Converter PDF→X habilitado", desc: "Landings /pdf-to-word, /pdf-to-excel, etc." },
+                    { key: "flag_product_tour_enabled", label: "Product tour habilitado", desc: "Onboarding 9 pasos en el editor (desktop)." },
+                    { key: "flag_blog_enabled", label: "Blog habilitado", desc: "Ruta /blog y enlaces del footer." },
+                    { key: "flag_promo_banner", label: "Banner promocional visible", desc: "Anuncio superior en todas las landings." },
+                    { key: "flag_ads_tracking", label: "Google Ads conversion tracking", desc: "Dispara eventos de gtag en /payment/success." },
+                    { key: "flag_recovery_emails", label: "Emails de recuperación (no-pagadores)", desc: "APAGADO desde el 12-ago: 1.195 envíos → 5 pagos, y se comían la cuota diaria de Resend que necesita el email de bienvenida. La retención de documentos sigue corriendo igual." },
+                  ].map((flag) => {
+                    const current = settingsQ.data?.find((s) => s.key === flag.key)?.value === "true";
+                    return (
+                      <div key={flag.key} className="flex items-center justify-between py-2.5 border-b last:border-0" style={{ borderColor: "#1e2433" }}>
+                        <div className="min-w-0 flex-1 pr-3">
+                          <p className="text-sm text-white font-medium">{flag.label}</p>
+                          <p className="text-[11px] text-gray-500 mt-0.5">{flag.desc}</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => saveSettingMut.mutate({ key: flag.key, value: current ? "false" : "true" })}
+                          className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors flex-shrink-0"
+                          style={{ backgroundColor: current ? "#10b981" : "#475569" }}
+                        >
+                          <span
+                            className="inline-block h-5 w-5 rounded-full bg-white transition-transform"
+                            style={{ transform: `translateX(${current ? "22px" : "2px"})` }}
+                          />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="text-[10px] text-gray-500 pt-2 border-t" style={{ borderColor: "#1e2433" }}>
+                  💡 Los flags se leen desde <code className="font-mono">site_settings</code>. Para usarlos en el código:{" "}
+                  <code className="font-mono">await getSiteSetting("flag_xxx") === "true"</code>.
+                </p>
+              </div>
+
+              {/* Test / QA panel — no real payments involved */}
+              <div
+                className="rounded-xl border p-5 space-y-4"
+                style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}
+              >
+                <div>
+                  <p className="text-sm font-semibold text-white">🧪 QA / Test panel (trial flow)</p>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Prueba el gate de 2 PDFs del trial sin esperar a descargar 3 documentos reales. No se cobra nada.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <button
+                    onClick={() => createFakeSubMut.mutate()}
+                    disabled={createFakeSubMut.isPending}
+                    className="px-4 py-3 rounded-lg text-sm font-semibold text-white transition-colors disabled:opacity-60"
+                    style={{ backgroundColor: "#8b5cf6" }}
+                  >
+                    {createFakeSubMut.isPending ? "Creando…" : "1. Crear sub trial falsa"}
+                  </button>
+                  <button
+                    onClick={() => simulateTrialMut.mutate()}
+                    disabled={simulateTrialMut.isPending}
+                    className="px-4 py-3 rounded-lg text-sm font-semibold text-white transition-colors disabled:opacity-60"
+                    style={{ backgroundColor: "#f59e0b" }}
+                  >
+                    {simulateTrialMut.isPending ? "Simulando…" : "2. Simular 2 descargas hechas"}
+                  </button>
+                  <button
+                    onClick={() => setPreviewPaywallReason("trial-limit")}
+                    className="px-4 py-3 rounded-lg text-sm font-semibold text-white transition-colors"
+                    style={{ backgroundColor: "#E63946" }}
+                  >
+                    Previsualizar paywall upgrade
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <button
+                    onClick={() => resetTrialMut.mutate()}
+                    disabled={resetTrialMut.isPending}
+                    className="px-4 py-2.5 rounded-lg text-xs font-semibold text-white transition-colors disabled:opacity-60"
+                    style={{ backgroundColor: "#10b981" }}
+                  >
+                    {resetTrialMut.isPending ? "Reseteando…" : "↺ Resetear mis descargas"}
+                  </button>
+                  <button
+                    onClick={() => deleteFakeSubMut.mutate()}
+                    disabled={deleteFakeSubMut.isPending}
+                    className="px-4 py-2.5 rounded-lg text-xs font-semibold text-white transition-colors disabled:opacity-60"
+                    style={{ backgroundColor: "#6b7280" }}
+                  >
+                    {deleteFakeSubMut.isPending ? "Eliminando…" : "↺ Eliminar sub trial falsa"}
+                  </button>
+                </div>
+                <div className="text-[11px] text-gray-500 leading-relaxed pt-3 border-t space-y-2" style={{ borderColor: "#1e2433" }}>
+                  <p><strong className="text-gray-300">Flujo end-to-end sin pagar:</strong></p>
+                  <ol className="list-decimal ml-4 space-y-1 text-gray-400">
+                    <li>Click <strong className="text-violet-400">"1. Crear sub trial falsa"</strong> → obtienes sub trial solo en DB local.</li>
+                    <li>Click <strong className="text-amber-400">"2. Simular 2 descargas hechas"</strong> → stampa 2 de tus docs como downloaded.</li>
+                    <li>Abre un PDF en el editor (tuyo, subido antes) → pulsa <strong>Descargar</strong> → debe aparecer el paywall de upgrade.</li>
+                    <li>Verás el mensaje + botón "Continuar sin límites 19,99€/mes". <strong className="text-red-400">NO pulses Activar</strong> — fallará porque la sub es falsa (protección esperada).</li>
+                    <li>Cuando acabes: limpia con <strong className="text-emerald-400">Resetear descargas</strong> + <strong>Eliminar sub falsa</strong>.</li>
+                  </ol>
+                </div>
+              </div>
+            </div>
+          )}
+          {!isFastDoc && tab === "blog" && <BlogAdmin />}
+          {!isFastDoc && tab === "trustpilot" && <TrustpilotAdmin />}
+        </main>
+      </div>
+
+      {/* ── QA: Paywall preview (no real state change) ── */}
+      <PaywallModal
+        isOpen={previewPaywallReason !== null}
+        onClose={() => setPreviewPaywallReason(null)}
+        reason={previewPaywallReason === "trial-limit" ? "trial-limit" : undefined}
+      />
+
+      {/* ── USER TIMELINE MODAL (U1) ── */}
+      {timelineUserId !== null && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)" }}
+          onClick={(e) => e.target === e.currentTarget && setTimelineUserId(null)}
+        >
+          <div
+            className="relative w-full max-w-3xl rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+            style={{ backgroundColor: "#0f1117", border: "1px solid #1e2433", maxHeight: "90vh" }}
+          >
+            <div className="px-6 py-4 border-b flex items-center justify-between" style={{ borderColor: "#1e2433" }}>
+              <div>
+                <p className="text-sm font-semibold text-white">Timeline del usuario</p>
+                {timelineQ.data?.user && (
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    {timelineQ.data.user.email} · ID {timelineQ.data.user.id}
+                  </p>
+                )}
+              </div>
+              <button
+                onClick={() => setTimelineUserId(null)}
+                className="w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10"
+              >
+                <X className="w-4 h-4 text-gray-300" />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto p-6 space-y-5">
+              {timelineQ.isLoading ? (
+                <p className="text-center text-gray-400">Cargando…</p>
+              ) : !timelineQ.data ? (
+                <p className="text-center text-gray-500">Usuario no encontrado.</p>
+              ) : (
+                <>
+                  {/* User summary */}
+                  <div className="rounded-xl p-4 grid grid-cols-2 md:grid-cols-4 gap-3" style={{ backgroundColor: "#131720", border: "1px solid #1e2433" }}>
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wide text-gray-500">Nombre</p>
+                      <p className="text-sm text-white">{timelineQ.data.user.name ?? "—"}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wide text-gray-500">Rol</p>
+                      <p className="text-sm text-white">{timelineQ.data.user.role}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wide text-gray-500">País</p>
+                      <p className="text-sm text-white">{timelineQ.data.user.country ?? "—"}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wide text-gray-500">Registro</p>
+                      <p className="text-sm text-white">{new Date(timelineQ.data.user.createdAt).toLocaleDateString("es-ES")}</p>
+                    </div>
+                    <div className="col-span-2 md:col-span-4">
+                      <p className="text-[10px] uppercase tracking-wide text-gray-500">Último acceso</p>
+                      <p className="text-sm text-white">{new Date(timelineQ.data.user.lastSignedIn).toLocaleString("es-ES")}</p>
+                    </div>
+                    {(timelineQ.data.user as any).adminNotes && (
+                      <div className="col-span-2 md:col-span-4 pt-2 border-t" style={{ borderColor: "#1e2433" }}>
+                        <p className="text-[10px] uppercase tracking-wide text-amber-500">Notas internas</p>
+                        <p className="text-sm text-amber-200 whitespace-pre-wrap">{(timelineQ.data.user as any).adminNotes}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Subscriptions */}
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Suscripciones ({timelineQ.data.subscriptions.length})</p>
+                    {timelineQ.data.subscriptions.length === 0 ? (
+                      <p className="text-sm text-gray-500 italic">Sin suscripciones.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {timelineQ.data.subscriptions.map((s: any) => (
+                          <div key={s.id} className="rounded-lg p-3 text-xs flex items-center gap-3" style={{ backgroundColor: "#131720", border: "1px solid #1e2433" }}>
+                            <span
+                              className="inline-flex px-2 py-0.5 rounded text-[10px] font-semibold"
+                              style={{
+                                backgroundColor:
+                                  s.status === "active" ? "#10b98120" :
+                                  s.status === "trialing" ? "#E6394620" :
+                                  s.status === "past_due" ? "#ef444420" :
+                                  s.status === "canceled" ? "#6b728020" : "#6b728020",
+                                color:
+                                  s.status === "active" ? "#10b981" :
+                                  s.status === "trialing" ? "#60a5fa" :
+                                  s.status === "past_due" ? "#ef4444" :
+                                  "#9ca3af",
+                              }}
+                            >{s.status}</span>
+                            <span className="text-gray-200 font-medium">{s.plan}</span>
+                            <span className="text-gray-400 flex-1">
+                              {s.currentPeriodEnd ? `hasta ${new Date(s.currentPeriodEnd).toLocaleDateString("es-ES")}` : "—"}
+                            </span>
+                            {s.cancelReason && (
+                              <span className="text-amber-400 text-[11px]">cancel: {s.cancelReason}</span>
+                            )}
+                            {s.sipayMaskedCard && (
+                              <span className="text-gray-400 font-mono text-[11px]">{s.sipayMaskedCard}</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Documents */}
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Documentos recientes ({timelineQ.data.documents.length})</p>
+                    {timelineQ.data.documents.length === 0 ? (
+                      <p className="text-sm text-gray-500 italic">Sin documentos.</p>
+                    ) : (
+                      <div className="rounded-lg overflow-hidden" style={{ border: "1px solid #1e2433" }}>
+                        <table className="w-full text-xs">
+                          <tbody>
+                            {timelineQ.data.documents.slice(0, 15).map((d: any) => (
+                              <tr key={d.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                                <td className="px-3 py-1.5 text-white truncate max-w-[260px]">{d.name}</td>
+                                <td className="px-3 py-1.5 text-right text-gray-300 font-mono w-20">
+                                  {d.fileSize < 1024 * 1024 ? `${(d.fileSize / 1024).toFixed(0)} KB` : `${(d.fileSize / (1024 * 1024)).toFixed(1)} MB`}
+                                </td>
+                                <td className="px-3 py-1.5 w-20">
+                                  <span
+                                    className="inline-flex px-1.5 py-0.5 rounded text-[10px]"
+                                    style={{
+                                      backgroundColor: d.paymentStatus === "paid" ? "#10b98120" : "#f59e0b20",
+                                      color: d.paymentStatus === "paid" ? "#10b981" : "#f59e0b",
+                                    }}
+                                  >{d.paymentStatus}</span>
+                                </td>
+                                <td className="px-3 py-1.5 text-gray-500 w-28 text-right">
+                                  {new Date(d.createdAt).toLocaleDateString("es-ES")}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Messages */}
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Mensajes de contacto ({timelineQ.data.messages.length})</p>
+                    {timelineQ.data.messages.length === 0 ? (
+                      <p className="text-sm text-gray-500 italic">Sin mensajes.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {timelineQ.data.messages.slice(0, 10).map((m: any) => (
+                          <div key={m.id} className="rounded-lg p-3 text-xs" style={{ backgroundColor: "#131720", border: "1px solid #1e2433" }}>
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-white font-medium">{m.subject}</span>
+                              <span className="text-gray-500 text-[10px]">{new Date(m.createdAt).toLocaleString("es-ES")}</span>
+                            </div>
+                            <p className="text-gray-300 whitespace-pre-wrap">{m.message}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Contact message status badge ─────────────────────────────
+// Three states: unread → pending (read but not replied) → replied.
+function StatusBadge({ read, repliedAt }: { read: boolean; repliedAt: string | Date | null }) {
+  let label = "Sin leer";
+  let bg = "#1e3a8a"; // blue
+  let fg = "#bfdbfe";
+  if (repliedAt) {
+    label = "Respondido"; bg = "#14532d"; fg = "#bbf7d0"; // green
+  } else if (read) {
+    label = "Pendiente"; bg = "#7c2d12"; fg = "#fed7aa"; // orange — needs attention
+  }
+  return (
+    <span
+      className="text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap"
+      style={{ backgroundColor: bg, color: fg }}
+    >
+      {label}
+    </span>
+  );
+}
+
+// ─── Recurrent-sender badge ───────────────────────────────────
+// Flags messages whose email already appears in other rows. Lets the
+// admin see at a glance "this person has written before" — the typical
+// case where a customer is following up on something we already replied to.
+function RecurrentBadge({ count }: { count: number }) {
+  return (
+    <span
+      className="text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap inline-flex items-center gap-1"
+      style={{ backgroundColor: "#581c87", color: "#e9d5ff" }}
+      title={`Este email ha enviado ${count} mensajes en total`}
+    >
+      🔁 {count}× cliente
+    </span>
+  );
+}
+
+// ─── Contact-form reason badge ────────────────────────────────
+// Maps the i18n reason values from the public contact form to a
+// short label + color so the admin can triage at a glance which
+// queue (billing / tech / feature / etc.) the message belongs to.
+function ReasonBadge({ reason }: { reason: string }) {
+  const r = reason.toLowerCase();
+  // Match common reason values in any language (es/en/fr/de/pt/it/nl/pl/ru/uk/ro/zh).
+  // Falls back to a neutral grey badge if we don't recognize the string.
+  let label = reason;
+  let bg = "#374151";
+  let fg = "#e5e7eb";
+  if (/(factur|billing|cobr|abono|paiement|abrechn|cobranza|fatur|rechnung|оплат|оплата|білі|账单|账户)/i.test(r)) {
+    label = "Facturación"; bg = "#7c2d12"; fg = "#fed7aa"; // orange-ish — high priority
+  } else if (/(soporte|tech|support|tecn|hilfe|aiut|hulp|pomoc|подд|допом|asisten)/i.test(r)) {
+    label = "Soporte técnico"; bg = "#1e3a8a"; fg = "#bfdbfe"; // blue
+  } else if (/(funci|feature|fonction|funktion|funzion|funcj|функц|функц|caract|功能)/i.test(r)) {
+    label = "Solicitud de función"; bg = "#14532d"; fg = "#bbf7d0"; // green
+  } else if (/(bug|error|fehl|erreur|errore|fout|błąd|ошиб|помилк|eroare|错误)/i.test(r)) {
+    label = "Informe de error"; bg = "#7f1d1d"; fg = "#fecaca"; // red
+  } else if (/(colabor|partner|parten|collab|współ|сотр|співп|parteneri|合作)/i.test(r)) {
+    label = "Colaboración"; bg = "#581c87"; fg = "#e9d5ff"; // purple
+  } else if (/(otro|other|autre|sonst|outro|altro|inn|др)/i.test(r)) {
+    label = "Otro"; bg = "#374151"; fg = "#e5e7eb";
+  }
+  return (
+    <span
+      className="text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap"
+      style={{ backgroundColor: bg, color: fg }}
+      title={reason}
+    >
+      {label}
+    </span>
+  );
+}
+
+// ─── Email template helpers ──────────────────────────────────
+function TemplateForm({ initial, onSubmit, submitting, submitLabel = "Crear plantilla", onCancel }: {
+  initial?: { name: string; body: string };
+  onSubmit: (data: { name: string; body: string }) => void;
+  submitting: boolean;
+  submitLabel?: string;
+  onCancel?: () => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [body, setBody] = useState(initial?.body ?? "");
+
+  return (
+    <div className="space-y-2 rounded-lg p-3 border" style={{ backgroundColor: "#0f1117", borderColor: "#1e2433" }}>
+      <input
+        type="text"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="Nombre (ej. ES — Aviso de cobro legítimo)"
+        className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-[#E63946]"
+        style={{ borderColor: "#1e2433", color: "#e2e8f0" }}
+      />
+      <textarea
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        placeholder="Cuerpo de la plantilla. Variables: {{name}}, {{email}}, {{subject}}, {{price}}"
+        rows={5}
+        className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-[#E63946]"
+        style={{ borderColor: "#1e2433", color: "#e2e8f0" }}
+      />
+      <div className="flex items-center gap-2 justify-end">
+        {onCancel && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-300"
+            style={{ backgroundColor: "#1e2433" }}
+          >
+            Cancelar
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => {
+            const n = name.trim(); const b = body.trim();
+            if (!n || !b) { toast.error("Nombre y cuerpo son obligatorios"); return; }
+            onSubmit({ name: n, body: b });
+            if (!initial) { setName(""); setBody(""); }
+          }}
+          disabled={submitting}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white transition-colors disabled:opacity-60"
+          style={{ backgroundColor: "#E63946" }}
+        >
+          {submitting ? <><Loader2 size={12} className="animate-spin" /> Guardando…</> : submitLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TemplateRow({ template, onUpdate, onDelete }: {
+  template: { id: number; name: string; body: string };
+  onUpdate: (data: { name: string; body: string }) => void;
+  onDelete: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  if (editing) {
+    return (
+      <TemplateForm
+        initial={{ name: template.name, body: template.body }}
+        submitLabel="Guardar cambios"
+        submitting={false}
+        onSubmit={(data) => { onUpdate(data); setEditing(false); }}
+        onCancel={() => setEditing(false)}
+      />
+    );
+  }
+  return (
+    <div className="rounded-lg p-3 border flex items-start gap-3" style={{ backgroundColor: "#0f1117", borderColor: "#1e2433" }}>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-semibold text-white truncate">{template.name}</p>
+        <p className="text-xs text-gray-400 mt-1 whitespace-pre-wrap line-clamp-3">{template.body}</p>
+      </div>
+      <div className="flex flex-col gap-1.5 flex-shrink-0">
+        <button
+          onClick={() => setEditing(true)}
+          className="px-2 py-1 rounded text-[11px] font-medium text-gray-300 hover:bg-gray-700"
+          style={{ backgroundColor: "#1e2433" }}
+        >
+          Editar
+        </button>
+        <button
+          onClick={onDelete}
+          className="px-2 py-1 rounded text-[11px] font-medium text-red-300 hover:bg-red-900/30"
+          style={{ backgroundColor: "#1e2433" }}
+        >
+          Borrar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── SettingRow helper ────────────────────────────────────────
+function SettingRow({
+  label,
+  defaultValue,
+  placeholder,
+  onSave,
+}: {
+  label: string;
+  defaultValue: string;
+  placeholder: string;
+  onSave: (value: string) => void;
+}) {
+  const [value, setValue] = useState(defaultValue);
+  const [saved, setSaved] = useState(false);
+
+  const handleSave = () => {
+    onSave(value);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  return (
+    <div className="flex items-center gap-3">
+      <label className="text-xs text-gray-400 w-44 flex-shrink-0">{label}</label>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => {
+          setValue(e.target.value);
+          setSaved(false);
+        }}
+        placeholder={placeholder}
+        className="flex-1 px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+        style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+      />
+      <button
+        onClick={handleSave}
+        className="px-3 py-2 rounded-lg text-xs font-medium text-white transition-colors flex-shrink-0"
+        style={{ backgroundColor: saved ? "#10b981" : "#E63946" }}
+      >
+        {saved ? "✓ Guardado" : "Guardar"}
+      </button>
+    </div>
+  );
+}
+
+// ─── WalletTokenCard — verify a user's stored token renews (no charge) ──────────
+function WalletTokenCard() {
+  const [userId, setUserId] = useState("");
+  const mut = trpc.admin.checkWalletToken.useMutation();
+  const r = mut.data;
+  return (
+    <div className="rounded-xl border p-5 space-y-4" style={{ backgroundColor: "#131720", borderColor: "#1E9E63" }}>
+      <div>
+        <p className="text-sm font-semibold text-white flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: "#1E9E63" }} />
+          Verificar renovación de wallet (sin cobrar)
+        </p>
+        <p className="text-xs text-gray-500 mt-1">
+          Comprueba si el token guardado de un usuario resuelve a una tarjeta cobrable vía{" "}
+          <code className="font-mono">/mdwr/v1/card</code>. Si resuelve, su suscripción renovará por MIT-R.{" "}
+          <strong>No mueve dinero.</strong>
+        </p>
+      </div>
+      <div className="flex gap-2">
+        <input
+          value={userId}
+          onChange={(e) => setUserId(e.target.value.replace(/\D/g, ""))}
+          placeholder="userId (ej. 53660)"
+          className="flex-1 px-3 py-2 rounded-lg text-sm text-white border"
+          style={{ backgroundColor: "#0B0E14", borderColor: "#334155" }}
+        />
+        <button
+          onClick={() => userId && mut.mutate({ userId: Number(userId) })}
+          disabled={mut.isPending || !userId}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50"
+          style={{ backgroundColor: "#1E9E63" }}
+        >
+          {mut.isPending ? "Comprobando…" : "Verificar"}
+        </button>
+      </div>
+      {mut.error && <p className="text-xs text-red-400">Error: {mut.error.message}</p>}
+      {r && (
+        <div className="text-xs space-y-1">
+          <p className={r.resolved ? "text-green-400 font-semibold" : "text-red-400 font-semibold"}>
+            {r.resolved ? "✅ Token válido — la sub renovará" : "❌ El token NO resuelve — NO renovará"}
+          </p>
+          <p className="text-gray-400">token: <code className="font-mono">{r.token || "(vacío)"}</code></p>
+          {r.detail && <p className="text-gray-400">detalle: {r.detail}</p>}
+          {r.raw && (
+            <details>
+              <summary className="text-gray-500 cursor-pointer">respuesta cruda</summary>
+              <pre className="mt-1 p-2 rounded bg-black/40 text-gray-400 overflow-x-auto text-[10px]">{r.raw}</pre>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SipayProbeCard (Phase 0 migration: validates HMAC + sandbox connectivity) ──
+function SipayProbeCard() {
+  const probeMut = trpc.admin.sipayProbe.useMutation();
+  const result = probeMut.data;
+  return (
+    <div
+      className="rounded-xl border p-5 space-y-4"
+      style={{ backgroundColor: "#131720", borderColor: "#E63946" }}
+    >
+      <div>
+        <p className="text-sm font-semibold text-white flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: "#E63946" }} />
+          Sipay sandbox probe (migración Fase 0)
+        </p>
+        <p className="text-xs text-gray-500 mt-1">
+          Lanza una petición <code className="font-mono">/mdwr/v1/all-in-one</code> contra{" "}
+          <code className="font-mono">sandbox.sipay.es</code> con la tarjeta de prueba VISA y devuelve la respuesta cruda.
+          Sirve para verificar que la firma HMAC y las credenciales están bien antes de migrar el modal de pago.
+        </p>
+      </div>
+      <button
+        onClick={() => probeMut.mutate()}
+        disabled={probeMut.isPending}
+        className="px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50"
+        style={{ backgroundColor: "#E63946" }}
+      >
+        {probeMut.isPending ? "Probando…" : "Lanzar probe sandbox"}
+      </button>
+      {probeMut.error && (
+        <p className="text-xs text-red-400">Error backend: {probeMut.error.message}</p>
+      )}
+      {result && (
+        <div className="space-y-2 text-xs font-mono">
+          <p className="text-gray-400">
+            HTTP <span className={result.ok ? "text-emerald-400" : "text-red-400"}>{result.httpStatus}</span> ·{" "}
+            <span className="text-gray-500">{result.endpoint}</span>
+          </p>
+          <details className="bg-black/30 rounded p-2">
+            <summary className="cursor-pointer text-gray-400">Respuesta Sipay (parsed)</summary>
+            <pre className="mt-2 overflow-x-auto text-[10px] text-emerald-200 whitespace-pre-wrap">
+              {JSON.stringify(result.data ?? result.raw, null, 2)}
+            </pre>
+          </details>
+          <details className="bg-black/30 rounded p-2">
+            <summary className="cursor-pointer text-gray-400">Cuerpo enviado + firma</summary>
+            <pre className="mt-2 overflow-x-auto text-[10px] text-gray-300 whitespace-pre-wrap">
+              signature (sha256 hex): {result.signature}
+              {"\n\n"}
+              body:{"\n"}
+              {result.requestBody}
+            </pre>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SipayCheckoutCard (Fase 1: FastPay → all-in-one → 3DS redirect) ──────────
+// End-to-end checkout test from the admin. Loads FastPay JS dynamically, mounts
+// the Sipay-styled button, and on its callback fires our backend to obtain the
+// 3DS redirect URL. Clicking "Ir a 3DS" navigates the parent window so Redsys
+// MPI loads top-level (banks block iframe embedding via X-Frame-Options).
+function SipayCheckoutCard() {
+  const configQ = trpc.subscription.sipayConfig.useQuery();
+  const initMut = trpc.subscription.sipayCheckoutInit.useMutation();
+  const [scriptReady, setScriptReady] = useState(false);
+  const [fastpayResult, setFastpayResult] = useState<any>(null);
+  const [redirectInfo, setRedirectInfo] = useState<{ redirectUrl: string; requestId: string; order: string } | null>(null);
+  const buttonHostRef = useRef<HTMLDivElement | null>(null);
+
+  // Load FastPay bundle once we know the URL. Idempotent — checks for an
+  // existing tag before injecting. We tell the bundle NOT to autoload on
+  // DOMContentLoaded (we missed that event anyway), so it doesn't race
+  // against our React-rendered button. We call window.Fastpay.loadAll()
+  // manually after the script + button are both in DOM.
+  useEffect(() => {
+    if (!configQ.data?.bundleUrl) return;
+    (window as any).DONT_AUTOLOAD_FPAY = true;
+    const existing = document.querySelector(`script[data-sipay-fastpay="1"]`) as HTMLScriptElement | null;
+    if (existing) {
+      setScriptReady(true);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = configQ.data.bundleUrl;
+    s.async = true;
+    s.dataset.sipayFastpay = "1";
+    s.onload = () => setScriptReady(true);
+    s.onerror = () => console.error("[Sipay] failed to load FastPay bundle");
+    document.head.appendChild(s);
+  }, [configQ.data?.bundleUrl]);
+
+  // FastPay scans for class="fastpay-btn" via getElementsByClassName. Once
+  // the bundle is loaded AND our button is in the DOM, trigger loadAll() so
+  // the click handler + iframe wiring get attached.
+  useEffect(() => {
+    if (!scriptReady) return;
+    if (!buttonHostRef.current?.querySelector(".fastpay-btn")) return;
+    const fp = (window as any).Fastpay;
+    if (fp && typeof fp.loadAll === "function") {
+      try { fp.loadAll(); } catch (err) { console.error("[Sipay] loadAll failed:", err); }
+    } else {
+      console.warn("[Sipay] window.Fastpay not exposed yet");
+    }
+  }, [scriptReady, configQ.data?.key]);
+
+  // FastPay JS scans the DOM for <button data-key=…> and decorates it. We expose
+  // a global callback name so its bundle can call us when the customer finishes
+  // entering the card.
+  useEffect(() => {
+    (window as any).__editorpdfFastpayResult = (resp: any) => {
+      console.log("[Sipay] FastPay result:", resp);
+      setFastpayResult(resp);
+    };
+    return () => {
+      delete (window as any).__editorpdfFastpayResult;
+    };
+  }, []);
+
+  const launchInit = async () => {
+    if (!fastpayResult?.payload?.request_id && !fastpayResult?.request_id) return;
+    const fpRequestId = fastpayResult.payload?.request_id ?? fastpayResult.request_id;
+    setRedirectInfo(null);
+    try {
+      const res = await initMut.mutateAsync({ fastpayRequestId: fpRequestId, amountCents: 50 });
+      setRedirectInfo(res);
+    } catch (err) {
+      console.error("[Sipay] init failed", err);
+    }
+  };
+
+  return (
+    <div
+      className="rounded-xl border p-5 space-y-4"
+      style={{ backgroundColor: "#131720", borderColor: "#E63946" }}
+    >
+      <div>
+        <p className="text-sm font-semibold text-white flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: "#E63946" }} />
+          Sipay checkout end-to-end (Fase 1)
+        </p>
+        <p className="text-xs text-gray-500 mt-1">
+          Carga FastPay JS, captura la tarjeta de prueba VISA en su iframe, manda el token al backend
+          para autorizar 0,50 €, y devuelve la URL de 3DS. Tarjeta sandbox:{" "}
+          <code className="font-mono">4548 8194 0777 7774 — 12/26 — CVV 123</code>.
+        </p>
+      </div>
+
+      {configQ.isLoading && <p className="text-xs text-gray-400">Cargando config Sipay…</p>}
+      {configQ.data && (
+        <p className="text-[11px] text-gray-500">
+          Entorno: <span className="text-emerald-400">{configQ.data.sandbox ? "SANDBOX" : "LIVE"}</span> · key:{" "}
+          <code className="font-mono">{configQ.data.key || "(no configurada)"}</code>
+        </p>
+      )}
+
+      <div
+        ref={buttonHostRef}
+        className="flex flex-col gap-3"
+        style={{ minHeight: 720 }}
+      >
+        {configQ.data?.key ? (
+          <>
+            <button
+              type="button"
+              data-key={configQ.data.key}
+              data-amount="50"
+              data-currency="EUR"
+              data-template="v4"
+              data-callback="__editorpdfFastpayResult"
+              data-lang="es"
+              data-paymentbutton="Capturar tarjeta (Sipay sandbox)"
+              data-hiddenprice="true"
+              className="fastpay-btn self-start px-4 py-2 rounded-lg text-sm font-medium text-white"
+              style={{ backgroundColor: "#0A0A0B", border: "1px solid #E63946" }}
+            >
+              {scriptReady ? "Capturar tarjeta (Sipay sandbox)" : "Cargando FastPay…"}
+            </button>
+            <style>{`
+              /* FastPay inserts its iframe right after the button via e.after().
+                 Force the iframe to take full width + enough height so the pay
+                 submit is visible without scrolling inside it. */
+              .fastpay-btn + iframe {
+                width: 100% !important;
+                min-height: 640px !important;
+                border: 0 !important;
+                background: transparent !important;
+              }
+            `}</style>
+          </>
+        ) : (
+          <p className="text-xs text-gray-500">Esperando config Sipay…</p>
+        )}
+      </div>
+
+      {fastpayResult && (
+        <div className="space-y-2">
+          <p className="text-xs text-emerald-300">
+            ✓ FastPay devolvió un request_id (tarjeta capturada).
+          </p>
+          <details className="bg-black/30 rounded p-2 text-xs font-mono">
+            <summary className="cursor-pointer text-gray-400">Resultado FastPay</summary>
+            <pre className="mt-2 overflow-x-auto text-[10px] text-emerald-200 whitespace-pre-wrap">
+              {JSON.stringify(fastpayResult, null, 2)}
+            </pre>
+          </details>
+          <button
+            onClick={launchInit}
+            disabled={initMut.isPending}
+            className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-50"
+            style={{ backgroundColor: "#E63946" }}
+          >
+            {initMut.isPending ? "Autorizando…" : "Autorizar 0,50 € + obtener URL 3DS"}
+          </button>
+        </div>
+      )}
+
+      {initMut.error && (
+        <p className="text-xs text-red-400">Error backend: {initMut.error.message}</p>
+      )}
+
+      {redirectInfo && (
+        <div className="space-y-2">
+          <p className="text-xs text-emerald-300">
+            ✓ Autorización lanzada. request_id: <code className="font-mono">{redirectInfo.requestId}</code>
+          </p>
+          <p className="text-xs text-gray-400">
+            order: <code className="font-mono">{redirectInfo.order}</code>
+          </p>
+          <a
+            href={redirectInfo.redirectUrl}
+            className="inline-block px-4 py-2 rounded-lg text-sm font-medium text-white"
+            style={{ backgroundColor: "#10b981" }}
+          >
+            Ir a 3DS Redsys →
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── CouponsTab (F7) ──────────────────────────────────────────
+function CouponsTab({ couponsQ, createCouponMut, deleteCouponMut }: { couponsQ: any; createCouponMut: any; deleteCouponMut: any }) {
+  const [form, setForm] = useState({
+    code: "",
+    percentOff: "20",
+    duration: "once" as "once" | "forever" | "repeating",
+    durationInMonths: "",
+    maxRedemptions: "",
+    expiresAt: "",
+  });
+  const submit = () => {
+    if (!form.code.trim()) { toast.error("El código es obligatorio"); return; }
+    const percent = parseFloat(form.percentOff);
+    if (!percent || percent < 1 || percent > 100) { toast.error("Porcentaje debe ser 1-100"); return; }
+    createCouponMut.mutate({
+      code: form.code.trim().toUpperCase(),
+      percentOff: percent,
+      duration: form.duration,
+      durationInMonths: form.duration === "repeating" && form.durationInMonths ? parseInt(form.durationInMonths) : undefined,
+      maxRedemptions: form.maxRedemptions ? parseInt(form.maxRedemptions) : undefined,
+      expiresAtIso: form.expiresAt ? new Date(form.expiresAt + "T23:59:59").toISOString() : undefined,
+    });
+    setForm({ code: "", percentOff: "20", duration: "once", durationInMonths: "", maxRedemptions: "", expiresAt: "" });
+  };
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-lg font-semibold text-white">Cupones de descuento</h2>
+
+      {/* Create form */}
+      <div className="rounded-xl border p-5 space-y-3" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+        <p className="text-sm font-semibold text-white">Crear cupón</p>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div>
+            <label className="text-[11px] text-gray-400 block mb-1">Código (user-facing)</label>
+            <input
+              type="text" placeholder="BLACKFRIDAY50"
+              value={form.code}
+              onChange={(e) => setForm({ ...form, code: e.target.value.toUpperCase() })}
+              className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+              style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+            />
+          </div>
+          <div>
+            <label className="text-[11px] text-gray-400 block mb-1">% descuento</label>
+            <input
+              type="number" min="1" max="100"
+              value={form.percentOff}
+              onChange={(e) => setForm({ ...form, percentOff: e.target.value })}
+              className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+              style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+            />
+          </div>
+          <div>
+            <label className="text-[11px] text-gray-400 block mb-1">Duración</label>
+            <select
+              value={form.duration}
+              onChange={(e) => setForm({ ...form, duration: e.target.value as any })}
+              className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+              style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+            >
+              <option value="once">Una vez</option>
+              <option value="forever">Siempre</option>
+              <option value="repeating">N meses</option>
+            </select>
+          </div>
+          {form.duration === "repeating" && (
+            <div>
+              <label className="text-[11px] text-gray-400 block mb-1">Meses</label>
+              <input
+                type="number" min="1" max="24" placeholder="3"
+                value={form.durationInMonths}
+                onChange={(e) => setForm({ ...form, durationInMonths: e.target.value })}
+                className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+                style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+              />
+            </div>
+          )}
+          <div>
+            <label className="text-[11px] text-gray-400 block mb-1">Máx. usos (opcional)</label>
+            <input
+              type="number" min="1" placeholder="100"
+              value={form.maxRedemptions}
+              onChange={(e) => setForm({ ...form, maxRedemptions: e.target.value })}
+              className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+              style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+            />
+          </div>
+          <div>
+            <label className="text-[11px] text-gray-400 block mb-1">Fecha caducidad (opcional)</label>
+            <input
+              type="date"
+              value={form.expiresAt}
+              onChange={(e) => setForm({ ...form, expiresAt: e.target.value })}
+              className="w-full px-3 py-2 rounded-lg text-sm border bg-transparent focus:outline-none focus:ring-1 focus:ring-red-600"
+              style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+            />
+          </div>
+        </div>
+        <button
+          onClick={submit}
+          disabled={createCouponMut.isPending}
+          className="px-4 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-60"
+          style={{ backgroundColor: "#E63946" }}
+        >
+          {createCouponMut.isPending ? "Creando…" : "Crear cupón"}
+        </button>
+      </div>
+
+      {/* List */}
+      <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: "#131720", borderColor: "#1e2433" }}>
+        <div className="px-5 py-3 border-b" style={{ borderColor: "#1e2433" }}>
+          <p className="text-sm font-semibold text-white">Cupones activos ({couponsQ.data?.length ?? 0})</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead style={{ backgroundColor: "#0a0d14" }}>
+              <tr className="text-left text-gray-400">
+                <th className="px-4 py-2 font-medium">Código</th>
+                <th className="px-4 py-2 font-medium">Descuento</th>
+                <th className="px-4 py-2 font-medium">Duración</th>
+                <th className="px-4 py-2 font-medium text-right">Usos</th>
+                <th className="px-4 py-2 font-medium">Expira</th>
+                <th className="px-4 py-2 font-medium">Acción</th>
+              </tr>
+            </thead>
+            <tbody>
+              {couponsQ.isLoading ? (
+                <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">Cargando…</td></tr>
+              ) : !couponsQ.data?.length ? (
+                <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">Sin cupones creados todavía.</td></tr>
+              ) : couponsQ.data.map((c: any) => {
+                const code = c.promotionCodes[0]?.code ?? c.id;
+                const expires = c.promotionCodes[0]?.expiresAt;
+                return (
+                  <tr key={c.id} className="border-t" style={{ borderColor: "#1e2433" }}>
+                    <td className="px-4 py-2 text-white font-mono font-bold">{code}</td>
+                    <td className="px-4 py-2 text-[#E63946] font-semibold">
+                      {c.percentOff ? `${c.percentOff}%` : `€${c.amountOff}`}
+                    </td>
+                    <td className="px-4 py-2 text-gray-300">
+                      {c.duration === "once" ? "Una vez" : c.duration === "forever" ? "Siempre" : `${c.durationInMonths} meses`}
+                    </td>
+                    <td className="px-4 py-2 text-right text-gray-200 font-mono">
+                      {c.timesRedeemed}
+                      {c.maxRedemptions && <span className="text-gray-500"> / {c.maxRedemptions}</span>}
+                    </td>
+                    <td className="px-4 py-2 text-gray-400">
+                      {expires ? new Date(expires).toLocaleDateString("es-ES") : "—"}
+                    </td>
+                    <td className="px-4 py-2">
+                      <button
+                        onClick={() => {
+                          if (confirm(`¿Eliminar cupón ${code}? Esto es irreversible.`)) {
+                            deleteCouponMut.mutate({ couponId: c.id });
+                          }
+                        }}
+                        className="px-2.5 py-1 rounded-md text-[11px] font-semibold text-white"
+                        style={{ backgroundColor: "#dc2626" }}
+                      >
+                        Eliminar
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Expediente de consentimiento — lo que se le manda al banco ante un contracargo.
+ *
+ * Busca por email y saca, para esa persona concreta: qué aceptó, cuándo, desde
+ * qué IP y navegador, en qué idioma, con qué importes vigentes, y el texto
+ * íntegro de los Términos tal y como estaban ESE día. Lo último es lo que
+ * distingue una prueba de una captura de pantalla hecha hoy.
+ */
+function ConsentTab() {
+  const [email, setEmail] = useState("");
+  const [buscado, setBuscado] = useState("");
+  const q = trpc.admin.consentDossier.useQuery(
+    { email: buscado },
+    { enabled: buscado.length > 3 },
+  );
+  const d: any = q.data;
+
+  const fecha = (v: any) =>
+    v ? new Date(v).toLocaleString("es-ES", { dateStyle: "medium", timeStyle: "medium", timeZone: "Europe/Madrid" }) : "—";
+  const eur = (c: any) => (c == null ? "—" : `${(Number(c) / 100).toFixed(2).replace(".", ",")} €`);
+
+  const copiar = () => {
+    if (!d?.found) return;
+    const lineas = [
+      `EXPEDIENTE DE CONSENTIMIENTO — ${d.user.email}`,
+      `Cuenta creada: ${fecha(d.user.createdAt)} (hora de Madrid)`,
+      "",
+      "CONSENTIMIENTOS REGISTRADOS",
+      ...d.consents.map((c: any) => [
+        `· ${c.event === "register" ? "Registro" : "Autorización de pago"} — ${fecha(c.createdAt)} (Madrid)`,
+        `  IP: ${c.ip ?? "—"}   Navegador: ${c.userAgent ?? "—"}`,
+        `  Idioma mostrado: ${c.lang ?? "—"}`,
+        c.introCents != null ? `  Importe inicial: ${eur(c.introCents)} · Recurrente: ${eur(c.recurringCents)}/mes · Prueba: ${c.trialHours ?? "—"} h` : null,
+        c.textShown ? `  Texto aceptado: "${c.textShown}"` : null,
+        c.termsHash ? `  Términos vigentes (SHA-256): ${c.termsHash}` : null,
+      ].filter(Boolean).join("\n")),
+      "",
+      "COBROS",
+      ...d.charges.map((c: any) => `· ${fecha(c.createdAt)} — ${eur(c.amountCents)} ${c.provider} ${c.status}${c.sipayTransactionId ? ` · txn ${c.sipayTransactionId}` : ""}`),
+    ];
+    void navigator.clipboard.writeText(lineas.join("\n"));
+    toast.success("Expediente copiado al portapapeles");
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-white">Expediente de consentimiento</h2>
+        <p className="text-xs text-gray-400 mt-0.5">
+          Qué aceptó un cliente concreto, cuándo y desde dónde — con el texto de los Términos tal y como estaban ese día.
+          Para responder a un banco ante un contracargo.
+        </p>
+      </div>
+
+      <div className="flex gap-2">
+        <input
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") setBuscado(email.trim()); }}
+          placeholder="email del cliente"
+          className="flex-1 rounded-lg px-3 py-2 text-sm text-white outline-none border"
+          style={{ backgroundColor: "#0d1117", borderColor: "#1e2433" }}
+        />
+        <button
+          onClick={() => setBuscado(email.trim())}
+          className="px-4 py-2 rounded-lg text-sm font-semibold text-white"
+          style={{ backgroundColor: "#E63946" }}
+        >
+          Buscar
+        </button>
+      </div>
+
+      {q.isLoading && buscado && <p className="text-xs text-gray-400">Buscando…</p>}
+      {d && !d.found && <p className="text-sm text-amber-400">No hay ningún cliente con ese email.</p>}
+
+      {d?.found && (
+        <div className="space-y-4">
+          <div className="rounded-xl border p-4 flex items-start justify-between gap-4"
+               style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-white truncate">{d.user.email}</p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                {d.user.name ?? "—"} · cuenta creada {fecha(d.user.createdAt)} · idioma {d.user.language ?? "—"}
+              </p>
+            </div>
+            <button onClick={copiar}
+              className="shrink-0 px-3 py-2 rounded-lg text-xs font-semibold text-white border"
+              style={{ borderColor: "#1e2433", backgroundColor: "#0d1117" }}>
+              Copiar expediente
+            </button>
+          </div>
+
+          {d.consents.length === 0 && (
+            <div className="rounded-xl border p-4 text-sm text-amber-400"
+                 style={{ borderColor: "#3f2d0d", backgroundColor: "#1c1608" }}>
+              Sin consentimientos registrados. Este cliente es anterior al 12-ago-2026, cuando se empezó a guardar la prueba.
+              Para su caso solo hay la evidencia indirecta: el email de bienvenida y los Términos publicados.
+            </div>
+          )}
+
+          {d.consents.map((c: any) => (
+            <div key={c.id} className="rounded-xl border p-4 space-y-2"
+                 style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded text-[11px] font-semibold"
+                      style={c.event === "payment"
+                        ? { backgroundColor: "rgba(230,57,70,0.15)", color: "#fca5a5" }
+                        : { backgroundColor: "rgba(255,255,255,0.08)", color: "#cbd5e1" }}>
+                  {c.event === "payment" ? "Autorización de pago" : "Registro"}
+                </span>
+                <span className="text-xs text-gray-300">{fecha(c.createdAt)} <span className="text-gray-500">Madrid</span></span>
+              </div>
+              {c.textShown && (
+                <p className="text-sm text-white leading-relaxed border-l-2 pl-3" style={{ borderColor: "#E63946" }}>
+                  “{c.textShown}”
+                </p>
+              )}
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-gray-400">
+                <span>IP: <span className="text-gray-200">{c.ip ?? "—"}</span></span>
+                <span>Idioma: <span className="text-gray-200">{c.lang ?? "—"}</span></span>
+                {c.introCents != null && <span>Cobro inicial: <span className="text-gray-200">{eur(c.introCents)}</span></span>}
+                {c.recurringCents != null && <span>Recurrente: <span className="text-gray-200">{eur(c.recurringCents)}/mes</span></span>}
+                {c.trialHours != null && <span>Prueba: <span className="text-gray-200">{c.trialHours} h</span></span>}
+                {c.provider && <span>Método: <span className="text-gray-200">{c.provider}</span></span>}
+              </div>
+              {c.userAgent && <p className="text-[11px] text-gray-500 break-all">{c.userAgent}</p>}
+              {c.termsHash && d.snapshots?.[c.termsHash] && (
+                <details className="text-[11px]">
+                  <summary className="cursor-pointer text-gray-400 hover:text-gray-200">
+                    Términos vigentes ese día (SHA-256 {String(c.termsHash).slice(0, 12)}…)
+                  </summary>
+                  <pre className="mt-2 p-3 rounded-lg overflow-auto max-h-72 whitespace-pre-wrap text-gray-300"
+                       style={{ backgroundColor: "#0d1117" }}>
+                    {d.snapshots[c.termsHash].content}
+                  </pre>
+                </details>
+              )}
+            </div>
+          ))}
+
+          {d.charges?.length > 0 && (
+            <div className="rounded-xl border overflow-hidden" style={{ borderColor: "#1e2433", backgroundColor: "#131720" }}>
+              <p className="px-4 py-2.5 text-xs font-semibold text-white border-b" style={{ borderColor: "#1e2433" }}>Cobros</p>
+              <table className="w-full text-xs">
+                <tbody>
+                  {d.charges.map((c: any) => (
+                    <tr key={c.id} className="border-b last:border-0" style={{ borderColor: "#1e2433" }}>
+                      <td className="px-4 py-2 text-gray-300">{fecha(c.createdAt)}</td>
+                      <td className="px-4 py-2 text-white font-semibold">{eur(c.amountCents)}</td>
+                      <td className="px-4 py-2 text-gray-400">{c.provider}</td>
+                      <td className="px-4 py-2">
+                        <span className={c.status === "ok" ? "text-emerald-400" : c.status === "refunded" ? "text-amber-400" : "text-red-400"}>
+                          {c.status}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2 text-gray-500 font-mono text-[10px]">{c.sipayTransactionId ?? ""}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Etiqueta legible de cada tipo de queja, con el color que indica la urgencia. */
+const DRAFT_KINDS: Record<string, { label: string; color: string; bg: string; nota?: string }> = {
+  refund_within_withdrawal: {
+    label: "Pide reembolso · dentro de los 14 días", color: "#fca5a5", bg: "rgba(230,57,70,0.15)",
+    nota: "Dentro del plazo de desistimiento: nuestros Términos y la ley de consumo obligan a devolver. Discutirlo acaba en contracargo, que cuesta más y penaliza el ratio con el banco.",
+  },
+  refund_outside_withdrawal: {
+    label: "Pide reembolso · fuera de plazo", color: "#fcd34d", bg: "rgba(252,211,77,0.12)",
+    nota: "Fuera de los 14 días. El borrador explica los hechos y ofrece cancelar; el reembolso queda a tu criterio.",
+  },
+  unaware: { label: "No sabía que se le cobraba", color: "#93c5fd", bg: "rgba(147,197,253,0.12)",
+    nota: "La queja más común. Suele cerrarse enseñando cuándo aceptó y qué correo recibió." },
+  cancel: { label: "Quiere cancelar", color: "#a7f3d0", bg: "rgba(167,243,208,0.12)" },
+  chargeback_threat: {
+    label: "Amenaza con el banco", color: "#fca5a5", bg: "rgba(230,57,70,0.2)",
+    nota: "Prioritario. Resolverlo hoy es más barato que la disputa, ganes o pierdas.",
+  },
+  other: { label: "Otro", color: "#cbd5e1", bg: "rgba(255,255,255,0.08)" },
+};
+
+/**
+ * Genera el borrador de respuesta bajo demanda y lo vuelca en el textarea.
+ *
+ * La consulta es `enabled: false` a propósito: no se pide nada hasta que el
+ * admin pulsa, para no lanzar una consulta por cada mensaje de la lista.
+ */
+function DraftButton({ msgId, onDraft }: { msgId: number; onDraft: (t: string) => void }) {
+  const [info, setInfo] = useState<any>(null);
+  const q = trpc.admin.draftReply.useQuery({ id: msgId }, { enabled: false });
+
+  const generar = async () => {
+    try {
+      const r = await q.refetch();
+      if (!r.data) { toast.error("No se pudo generar el borrador"); return; }
+      setInfo(r.data);
+      onDraft(r.data.draft);
+      if (!r.data.usuarioEncontrado) toast.warning("No hay cuenta con ese email — el borrador va sin datos de compra");
+    } catch {
+      toast.error("No se pudo generar el borrador");
+    }
+  };
+
+  const k = info ? DRAFT_KINDS[info.kind] ?? DRAFT_KINDS.other : null;
+
+  return (
+    <div className="space-y-2">
+      <button
+        onClick={generar}
+        disabled={q.isFetching}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors disabled:opacity-60"
+        style={{ borderColor: "#1e2433", color: "#e2e8f0", backgroundColor: "#0f1117" }}
+      >
+        {q.isFetching ? <><Loader2 size={12} className="animate-spin" /> Generando…</> : <>⚖️ Borrador con pruebas</>}
+      </button>
+
+      {info && k && (
+        <div className="rounded-lg border p-2.5 space-y-1.5" style={{ borderColor: "#1e2433", backgroundColor: "#0f1117" }}>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="px-2 py-0.5 rounded text-[11px] font-semibold" style={{ color: k.color, backgroundColor: k.bg }}>
+              {k.label}
+            </span>
+            {info.diasDesdeCompra != null && (
+              <span className="text-[11px] text-gray-400">{info.diasDesdeCompra} días desde la compra</span>
+            )}
+            <span className="text-[11px]" style={{ color: info.tieneConsentimiento ? "#6ee7b7" : "#fcd34d" }}>
+              {info.tieneConsentimiento ? "✓ consentimiento registrado" : "⚠ sin consentimiento registrado (cliente anterior al 12-ago)"}
+            </span>
+          </div>
+          {k.nota && <p className="text-[11px] text-gray-400 leading-relaxed">{k.nota}</p>}
+          <p className="text-[10px] text-gray-500">
+            Revísalo y edítalo antes de enviar. Nada sale automáticamente.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,1942 @@
+import { z } from "zod";
+import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
+import { trialEndFrom } from "@shared/trial";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { deviceFromUA } from "./_core/telegram";
+import { systemRouter } from "./_core/systemRouter";
+import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { TRPCError } from "@trpc/server";
+import bcrypt from "bcryptjs";
+import {
+  getActiveSubscription,
+  recordConsent,
+  getActiveMonthlyPrice,
+  userHasActiveSubscription,
+  cancelSubscriptionDb,
+  getAllUsers,
+  getUserById,
+  getUserByEmail,
+  getUserByGoogleId,
+  getUserByResetToken,
+  createOwnUser,
+  updateUserPassword,
+  setResetToken,
+  clearResetToken,
+  deactivateUser,
+  deleteUserById,
+  updateUserProfile,
+  getDocumentsByUserId,
+  createDocument,
+  updateDocument,
+  deleteDocument,
+  getDocumentById,
+  getFoldersByUserId,
+  createFolder,
+  deleteFolder,
+  getTeamInvitations,
+  createTeamInvitation,
+  removeTeamInvitation,
+  getLegalPage,
+  getAllLegalPages,
+  upsertLegalPage,
+  getSiteSetting,
+  setSiteSetting,
+  getAllSiteSettings,
+  createContactMessage,
+  getAllContactMessages,
+  markContactMessageRead,
+  markContactMessageReplied,
+  getContactMessageById,
+  deleteContactMessage,
+  deleteContactMessages,
+  setContactMessagesArchived,
+  getEmailTemplates,
+  createEmailTemplate,
+  updateEmailTemplate,
+  deleteEmailTemplate,
+  getAdminStats,
+  getAllSubscribedUsers,
+  getAllDocuments,
+  getAuditLog,
+  getBillingStats,
+  getCancelReasonsAgg,
+  getCanceledSubscriptions,
+  getHealthChecks,
+  getPastDueSubs,
+  getRecentSubsWithoutPayment,
+  getRevenueByCountry,
+  getStorageByUser,
+  getChargesList,
+  getGclidConversions,
+  getRevenue,
+  getDailyIntroCharges,
+  getSubsAboutToCancel,
+  getUserTimeline,
+  getWebhookEvents,
+  recordAuditEntry,
+  refundCharge,
+  setCancelReason,
+  setUserAdminNotes,
+  getBlogPosts,
+  getBlogPost,
+  getBlogPostById,
+  createBlogPost,
+  updateBlogPost,
+  deleteBlogPost,
+} from "./db";
+import { storagePut } from "./storage";
+
+const adminProcedure = protectedProcedure.use(({ ctx, next }) => {
+  if (ctx.user.role !== "admin") {
+    throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+  }
+  return next({ ctx });
+});
+
+/**
+ * IP real del cliente. Detrás de Cloudflare y Railway la conexión llega desde
+ * un proxy, así que `req.ip` sería la del proxy — inútil como prueba. Se lee la
+ * cabecera de Cloudflare primero y se cae a la cadena de X-Forwarded-For.
+ */
+function clientIpOf(req: any): string {
+  return String(
+    req?.headers?.["cf-connecting-ip"]
+      ?? String(req?.headers?.["x-forwarded-for"] ?? "").split(",")[0]
+      ?? req?.ip
+      ?? "",
+  ).trim().slice(0, 64);
+}
+
+export const appRouter = router({
+  system: systemRouter,
+
+  // ─── Public site config (no auth) ──────────────────────────────
+  site: router({
+    /**
+     * Announcement banner shown site-wide. Returns null when the flag is
+     * off or no message is configured, so the client can skip rendering.
+     * Banner flag is EXPLICIT opt-in — unlike the other flags, we don't
+     * want a banner unless the admin actively turns it on.
+     */
+    announcement: publicProcedure.query(async () => {
+      const [enabled, text, level] = await Promise.all([
+        getSiteSetting("flag_promo_banner"),
+        getSiteSetting("promo_banner_text"),
+        getSiteSetting("promo_banner_level"),
+      ]);
+      if (enabled !== "true") return null;
+      const message = text?.trim();
+      if (!message) return null;
+      return {
+        message,
+        level: (level ?? "info") as "info" | "warning" | "success",
+      };
+    }),
+
+    /**
+     * Active subscription pricing — read from `site_settings.subscription_price_eur`
+     * with fallback to a default. Returns numeric eur + a few preformatted
+     * strings so consumers don't reimplement locale formatting. El importe que
+     * se cobra sale de aquí; no hay ningún identificador de precio externo, y
+     * NOT exposed here (server-only — see `confirmSetup`).
+     */
+    pricing: publicProcedure.query(async () => {
+      const raw = await getSiteSetting("subscription_price_eur");
+      const priceEur = (() => {
+        const n = Number((raw ?? "").replace(",", "."));
+        return Number.isFinite(n) && n > 0 ? n : 19.95;
+      })();
+      // "39.90" → "39,90" for de/es/fr/it/pl/pt/ro/ru/uk; "39.90" stays for en/zh/nl
+      const decimals = priceEur.toFixed(2);
+      const comma = decimals.replace(".", ",");
+      const { getTrialHours, getIntroPriceCents } = await import("./db");
+      const trialHours = await getTrialHours();
+      // The alta amount is now decided server-side (see _core/altaGuard.ts).
+      // Publish it so the wallet sheets and the price card show exactly what
+      // we are going to charge — a buyer must never see 0,50 € on the Apple
+      // Pay sheet and be charged something else.
+      const introCents = await getIntroPriceCents();
+      return {
+        priceEur,
+        priceComma: comma,           // "39,90"
+        priceDot: decimals,          // "39.90"
+        priceFormattedEs: `${comma}€`, // "39,90€" — used everywhere in es-style copy
+        trialHours,                  // trial length in HOURS (for the checkout billing notice)
+        introCents,                  // alta amount in cents — authoritative
+        introFormattedEs: `${(introCents / 100).toFixed(2).replace(".", ",")} €`,
+      };
+    }),
+
+    /**
+     * Feature flags consumed by the client. Default = ON when the
+     * site_settings row is missing. Admin must explicitly set "false"
+     * to disable a feature. That way the app behaves normally out of
+     * the box but the admin can kill-switch a feature without deploy.
+     */
+    flags: publicProcedure.query(async () => {
+      const [converter, tour, blog, ads] = await Promise.all([
+        getSiteSetting("flag_converter_enabled"),
+        getSiteSetting("flag_product_tour_enabled"),
+        getSiteSetting("flag_blog_enabled"),
+        getSiteSetting("flag_ads_tracking"),
+      ]);
+      // Default to enabled unless explicitly "false"
+      const on = (v: string | null | undefined) => v !== "false";
+      // La pasarela ya no es una bandera: sólo hay Sipay. Se devolvía un
+      // `paymentProvider` que por defecto valía "stripe" y que no leía nadie —
+      // el modal de pago lo tiene fijo.
+      return {
+        converterEnabled: on(converter),
+        productTourEnabled: on(tour),
+        blogEnabled: on(blog),
+        adsTrackingEnabled: on(ads),
+      };
+    }),
+  }),
+
+  // ─── Auth ──────────────────────────────────────────────────────
+  auth: router({
+    me: publicProcedure.query((opts) => opts.ctx.user),
+
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      // Also clear any LEGACY host-only cookie (set before the shared
+      // .pdfeditoronline.net domain existed). clearCookie only matches by name +
+      // domain + path, so without this the old host-only cookie survives and
+      // the user gets silently re-authenticated right after logging out.
+      const hostOnlyOpts = { ...cookieOptions };
+      delete (hostOnlyOpts as any).domain;
+      ctx.res.clearCookie(COOKIE_NAME, { ...hostOnlyOpts, maxAge: -1 });
+      return { success: true } as const;
+    }),
+
+    // Own auth: register with email+password
+    register: publicProcedure
+      .input(z.object({
+        email: z.string().email(),
+        password: z.string().min(6),
+        name: z.string().min(1).max(128).optional(),
+        // Frase de aceptación que el cliente tenía delante al pulsar el botón,
+        // ya traducida. Se guarda literal: en una disputa lo que vale es lo que
+        // vio esa persona, no lo que hoy diga la web.
+        consentText: z.string().max(1000).optional(),
+        lang: z.string().max(8).optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        const existing = await getUserByEmail(input.email);
+        if (existing) throw new TRPCError({ code: "CONFLICT", message: "Este email ya está registrado" });
+        const passwordHash = await bcrypt.hash(input.password, 12);
+        const role = "user";
+        const user = await createOwnUser({
+          email: input.email,
+          name: input.name ?? input.email.split("@")[0],
+          passwordHash,
+          loginMethod: "email",
+          role,
+        });
+        if (!user) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Error al crear usuario" });
+        const { sdk } = await import("./_core/sdk");
+        const token = await sdk.createSessionToken(user.openId, { name: user.name ?? "", expiresInMs: ONE_YEAR_MS });
+        const cookieOptions = getSessionCookieOptions(ctx.req);
+        ctx.res.cookie(COOKIE_NAME, token, { ...cookieOptions, maxAge: ONE_YEAR_MS });
+        // Prueba de consentimiento. No se espera: si falla, se pierde la prueba
+        // de este registro, pero la cuenta se crea igual.
+        void recordConsent({
+          userId: user.id,
+          event: "register",
+          ip: clientIpOf(ctx.req),
+          userAgent: String(ctx.req?.headers?.["user-agent"] ?? ""),
+          lang: input.lang ?? null,
+          textShown: input.consentText ?? null,
+        });
+        return { success: true, user: { id: user.id, email: user.email, name: user.name, role: user.role } };
+      }),
+
+    // Own auth: login with email+password
+    login: publicProcedure
+      .input(z.object({
+        email: z.string().email(),
+        password: z.string().min(1),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        const user = await getUserByEmail(input.email);
+        if (!user) throw new TRPCError({ code: "UNAUTHORIZED", message: "Email o contraseña incorrectos" });
+        if (!user.passwordHash) throw new TRPCError({ code: "UNAUTHORIZED", message: "Esta cuenta usa Google. Inicia sesión con Google." });
+        const valid = await bcrypt.compare(input.password, user.passwordHash);
+        if (!valid) throw new TRPCError({ code: "UNAUTHORIZED", message: "Email o contraseña incorrectos" });
+        const { sdk } = await import("./_core/sdk");
+        const token = await sdk.createSessionToken(user.openId, { name: user.name ?? "", expiresInMs: ONE_YEAR_MS });
+        const cookieOptions = getSessionCookieOptions(ctx.req);
+        ctx.res.cookie(COOKIE_NAME, token, { ...cookieOptions, maxAge: ONE_YEAR_MS });
+        return { success: true, user: { id: user.id, email: user.email, name: user.name, role: user.role } };
+      }),
+
+    // Own auth: forgot password — generate reset token + send email
+    forgotPassword: publicProcedure
+      .input(z.object({ email: z.string().email() }))
+      .mutation(async ({ ctx, input }) => {
+        const user = await getUserByEmail(input.email);
+        // Always return success to avoid email enumeration
+        if (!user) return { success: true };
+        const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        const expiry = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
+        await setResetToken(user.id, token, expiry);
+
+        // Build reset link from the request host so it works in both prod
+        // (pdfeditoronline.net) and any preview/local environment.
+        const proto = (ctx.req.headers["x-forwarded-proto"] as string)?.split(",")[0] ?? ctx.req.protocol ?? "https";
+        const host = (ctx.req.headers["x-forwarded-host"] as string) ?? ctx.req.headers.host ?? "pdfeditoronline.net";
+        const resetUrl = `${proto}://${host}/reset-password?token=${encodeURIComponent(token)}`;
+
+        const { sendPasswordResetEmail } = await import("./email");
+        sendPasswordResetEmail({
+          to: input.email,
+          name: user.name ?? null,
+          resetUrl,
+        }).catch((err) => console.error("[Auth] Reset email send error:", err));
+
+        // Dev-only: also log the token so you can test without checking inbox.
+        if (process.env.NODE_ENV !== "production") {
+          console.log(`[Auth] Reset token for ${input.email}: ${token} → ${resetUrl}`);
+        }
+        return { success: true };
+      }),
+
+    // Own auth: reset password with token
+    resetPassword: publicProcedure
+      .input(z.object({ token: z.string(), password: z.string().min(6) }))
+      .mutation(async ({ input }) => {
+        const user = await getUserByResetToken(input.token);
+        if (!user) throw new TRPCError({ code: "BAD_REQUEST", message: "Token inválido o expirado" });
+        if (user.resetTokenExpiry && user.resetTokenExpiry < new Date()) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "El enlace ha expirado" });
+        }
+        const passwordHash = await bcrypt.hash(input.password, 12);
+        await updateUserPassword(user.id, passwordHash);
+        await clearResetToken(user.id);
+        return { success: true };
+      }),
+
+    // Admin: set/change own password
+    setPassword: protectedProcedure
+      .input(z.object({ password: z.string().min(6) }))
+      .mutation(async ({ ctx, input }) => {
+        const passwordHash = await bcrypt.hash(input.password, 12);
+        await updateUserPassword(ctx.user.id, passwordHash);
+        return { success: true };
+      }),
+  }),
+
+  // ─── User Profile ──────────────────────────────────────────────
+  user: router({
+    getProfile: protectedProcedure.query(async ({ ctx }) => {
+      const user = await getUserById(ctx.user.id);
+      const sub = await getActiveSubscription(ctx.user.id);
+      return {
+        ...user,
+        subscription: sub
+          ? {
+              plan: sub.plan,
+              status: sub.status,
+              currentPeriodEnd: sub.currentPeriodEnd,
+              cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+            }
+          : null,
+      };
+    }),
+
+    updateProfile: protectedProcedure
+      .input(
+        z.object({
+          name: z.string().min(1).max(128).optional(),
+          email: z.string().email().optional(),
+          phone: z.string().max(32).optional(),
+          language: z.string().max(16).optional(),
+          timezone: z.string().max(64).optional(),
+          country: z.string().max(64).optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        await updateUserProfile(ctx.user.id, input);
+        return { success: true };
+      }),
+
+    deleteAccount: protectedProcedure.mutation(async ({ ctx }) => {
+      await deleteUserById(ctx.user.id);
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      // Also clear any LEGACY host-only cookie (set before the shared
+      // .pdfeditoronline.net domain existed). clearCookie only matches by name +
+      // domain + path, so without this the old host-only cookie survives and
+      // the user gets silently re-authenticated right after logging out.
+      const hostOnlyOpts = { ...cookieOptions };
+      delete (hostOnlyOpts as any).domain;
+      ctx.res.clearCookie(COOKIE_NAME, { ...hostOnlyOpts, maxAge: -1 });
+      return { success: true };
+    }),
+  }),
+
+  // ─── Subscriptions ────────────────────────────────────────────
+  subscription: router({
+    status: publicProcedure.query(async ({ ctx }) => {
+      if (!ctx.user) {
+        return { isPremium: false, subscription: null };
+      }
+      const isPremium = await userHasActiveSubscription(ctx.user.id);
+      const sub = await getActiveSubscription(ctx.user.id);
+      // Impago: `getActiveSubscription` devuelve null, así que sin esto el panel
+      // no puede contarle al cliente que su cobro falló ni ofrecerle arreglarlo.
+      // Era el agujero de los 198 en past_due a los que nadie avisaba.
+      let impago: { amountDueCents: number; declineCode: string | null } | null = null;
+      if (!sub) {
+        const { getLatestSubscription } = await import("./db");
+        const ultima = await getLatestSubscription(ctx.user.id);
+        if (ultima && ultima.status === "past_due") {
+          impago = {
+            amountDueCents: ultima.recurringCents ?? Math.round((await getActiveMonthlyPrice()).eur * 100),
+            declineCode: ultima.lastDeclineCode ?? null,
+          };
+        }
+      }
+      return {
+        isPremium,
+        pastDue: impago,
+        subscription: sub
+          ? {
+              plan: sub.plan,
+              status: sub.status,
+              currentPeriodEnd: sub.currentPeriodEnd,
+              cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+              // Lo que paga ESTA persona, no el precio de tarifa. Desde que el
+              // precio se ancla por suscripción (migración 0025), enseñarle el
+              // global a un cliente antiguo sería mentirle en su propio panel:
+              // vería 39,95 € cobrando 29,95 €. Null = fila sin anclar todavía.
+              recurringCents: sub.recurringCents ?? null,
+            }
+          : null,
+      };
+    }),
+
+    cancel: protectedProcedure.mutation(async ({ ctx }) => {
+      await cancelSubscriptionDb(ctx.user.id);
+      return { success: true };
+    }),
+
+    // ── Trial usage gate ────────────────────────────────────
+    trialUsage: protectedProcedure.query(async ({ ctx }) => {
+      const { getTrialUsageCount } = await import("./db");
+      const usage = await getTrialUsageCount(ctx.user.id);
+      const blocked = usage.isTrialing && usage.limit !== null && usage.count >= usage.limit;
+      return {
+        isTrialing: usage.isTrialing,
+        usage: usage.count,
+        limit: usage.limit,
+        blocked,
+      };
+    }),
+
+    // ── Record a download (increments trial counter if applicable) ──
+    recordDownload: protectedProcedure
+      .input(z.object({ docId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        const { canDownloadForUser, recordDocumentDownload } = await import("./db");
+        const gate = await canDownloadForUser(ctx.user.id, input.docId);
+        if (!gate.allowed) {
+          return {
+            allowed: false as const,
+            reason: (gate as any).reason ?? "blocked",
+            usage: (gate as any).usage,
+            limit: (gate as any).limit,
+          };
+        }
+        await recordDocumentDownload(ctx.user.id, input.docId);
+        return { allowed: true as const };
+      }),
+
+    // ── 1-click upgrade: end trial now + charge saved card ──
+    upgradeTrialNow: protectedProcedure.mutation(async ({ ctx }) => {
+      const { upgradeTrialImmediately, recordAuditEntry, getActiveSubscription } = await import("./db");
+      const sub = await getActiveSubscription(ctx.user.id);
+      const result = await upgradeTrialImmediately(ctx.user.id);
+      if (result.success) {
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "upgrade_trial_now",
+          targetType: "subscription",
+          targetId: String(sub?.id ?? ""),
+          metadata: { chargedAmountEur: result.chargedAmountEur },
+        });
+      }
+      return result;
+    }),
+
+    // Sipay config — returns FastPay merchant key + bundle URL to frontend.
+    // Key is public (it's the merchant identifier used in data-key); the
+    // secret stays server-side and signs all-in-one calls.
+    sipayConfig: publicProcedure.query(async () => {
+      const { ENV } = await import("./_core/env");
+      const sandbox = ENV.sipayEndpoint.includes("sandbox");
+      return {
+        key: ENV.sipayKey,
+        endpoint: ENV.sipayEndpoint,
+        bundleUrl: `${ENV.sipayEndpoint}/fpay/v1/static/bundle/fastpay.js`,
+        sandbox,
+      };
+    }),
+
+    // Apple Pay one-shot authorization. Front-end gets the structured
+    // payment token from Apple's PassKit (paymentData + paymentMethod +
+    // transactionIdentifier) AFTER our /api/sipay/applepay/validate-merchant
+    // endpoint has answered onvalidatemerchant. We forward to Sipay
+    // /mdwr/v1/authorization with catcher.type="apay". No 3DS redirect
+    // because Apple already authenticated the buyer via Face/Touch ID.
+    sipayApplePayCharge: protectedProcedure
+      .input(z.object({
+        tokenApay: z.object({
+          paymentData: z.any(),
+          paymentMethod: z.any(),
+          transactionIdentifier: z.string().min(1),
+        }),
+        requestId: z.string().min(1),
+        amountCents: z.number().int().positive(),
+        gclid: z.string().max(512).optional(),
+        gclidType: z.string().max(16).optional(),
+        lang: z.string().max(8).optional(),
+        // Frase de aceptación que el comprador tenía delante al autorizar.
+        consentText: z.string().max(1000).optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        // Idempotency + server-side price. See _core/altaGuard.ts — the client
+        // no longer decides either whether we charge or how much.
+        const { openAltaGuard, recordAltaBlocked, recordAltaPriceMismatch } = await import("./_core/altaGuard");
+        const guard = await openAltaGuard(ctx.user.id);
+        if (!guard.ok) {
+          await recordAltaBlocked({
+            userId: ctx.user.id, method: "apay", reason: guard.reason,
+            existingChargeId: guard.existing?.id, clientAmountCents: input.amountCents,
+          });
+          if (guard.reason === "already_paid" && guard.existing) {
+            // Already paid: hand back the ORIGINAL charge so the buyer lands on
+            // the success page with their file, without paying twice.
+            return {
+              transactionId: guard.existing.sipayTransactionId ?? "",
+              maskedCard: guard.existing.sipayMaskedCard ?? "",
+              cardBrand: "",
+              order: guard.existing.sipayOrder ?? "",
+              duplicate: true,
+            };
+          }
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "Ya hay un pago en curso para esta cuenta. Espera unos segundos.",
+          });
+        }
+        if (input.amountCents !== guard.amountCents) {
+          await recordAltaPriceMismatch({
+            userId: ctx.user.id, method: "apay",
+            clientAmountCents: input.amountCents, serverAmountCents: guard.amountCents,
+          });
+        }
+        const amountCents = guard.amountCents;
+        try {
+        const { chargeApplePay } = await import("./_core/sipay");
+        const order = `apay-${ctx.user.id}-${Date.now()}`;
+        const startedAt = Date.now();
+        // Log the funnel start so the admin can compare started → succeeded
+        // and spot Sipay-side rejections vs Apple-side abandons.
+        const { recordWebhookEvent: recordEvtStart } = await import("./db");
+        await recordEvtStart({
+          provider: "sipay",
+          eventType: "apay_init_started",
+          eventId: order,
+          status: "ok",
+          durationMs: 0,
+          // `lang` = la edición de idioma en la que compró. Se registra aquí
+          // para poder reconstruirlo después: hasta el 12-ago-2026 los eventos
+          // de wallet no lo guardaban y no quedaba rastro de en qué idioma
+          // había que escribir a ese cliente.
+          payload: { userId: ctx.user.id, amountCents, lang: input.lang ?? null },
+        });
+        const result = await chargeApplePay({
+          amountCents,
+          tokenApay: input.tokenApay,
+          requestId: input.requestId,
+          order,
+          token: `usr-${ctx.user.id}`,
+          custom_01: String(ctx.user.id),
+        });
+        const data = result.data as any;
+        const payloadCode = data?.payload?.code ?? data?.code;
+        if (!result.ok || payloadCode !== "0") {
+          const { recordWebhookEvent } = await import("./db");
+          await recordWebhookEvent({
+            provider: "sipay",
+            eventType: "apay_charge_failed",
+            eventId: order,
+            status: "error",
+            errorMessage: data?.payload?.detail ?? data?.detail ?? "unknown",
+            durationMs: Date.now() - startedAt,
+            payload: data ?? result.raw,
+          });
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `Sipay rechazó Apple Pay: ${JSON.stringify(data ?? result.raw)}`,
+          });
+        }
+        const txn = data?.payload?.transaction_id ?? "";
+        const masked = data?.payload?.masked_card ?? "";
+        const { upsertSubscription, markDocumentsPaid, recordWebhookEvent, recordCharge, setUserCountryIfEmpty, setUserLanguage, getTrialHours } = await import("./db");
+        const now = new Date();
+        // 0,50 € intro buys a trial of site_settings.trial_hours. After it expires
+        // the cron picks the sub up and charges the MIT-R, which extends 30 days.
+        const trialHours = await getTrialHours();
+        const periodEnd = trialEndFrom(now, trialHours);
+        // El precio recurrente vigente AHORA queda anclado a esta suscripción y
+        // es el que se le cobrará siempre: una subida posterior es solo para
+        // altas nuevas. Es el mismo importe que se guarda en su consentimiento.
+        const recurringCents = Math.round((await getActiveMonthlyPrice()).eur * 100);
+        await upsertSubscription({
+          userId: ctx.user.id,
+          // Store the merchant token we vaulted the card under (`usr-<userId>`),
+          // NOT the cof_id — Sipay charges MIT-R against the merchant token, and
+          // rejects the cof_id with "no_card_from_token". Prefer the echoed
+          // token, fall back to the deterministic usr-<userId>.
+          sipayToken: data?.payload?.token ?? `usr-${ctx.user.id}`,
+          sipayOrder: order,
+          sipayTransactionId: txn,
+          sipayMaskedCard: masked,
+          sipayProvider: "apay",
+          plan: "trial",
+          status: "trialing",
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd,
+          trialHours,
+          recurringCents,
+          cancelAtPeriodEnd: false,
+        });
+        await markDocumentsPaid(ctx.user.id);
+        // Persist payer country (Cloudflare geo) for revenue-by-country, first
+        // payment wins.
+        await setUserCountryIfEmpty(ctx.user.id, String(ctx.req?.headers?.["cf-ipcountry"] ?? ""));
+        await recordCharge({
+          userId: ctx.user.id,
+          provider: "apay",
+          amountCents,
+          sipayTransactionId: txn,
+          sipayOrder: order,
+          sipayMaskedCard: masked,
+          status: "ok",
+          gclid: input.gclid,
+          gclidType: input.gclidType,
+          deviceType: deviceFromUA(String(ctx.req?.headers?.["user-agent"] ?? "")),
+          cardCountry: data?.payload?.card_country ?? null,
+          geoCountry: String(ctx.req?.headers?.["cf-ipcountry"] ?? ""),
+        });
+        // Prueba de consentimiento del cobro: qué aceptó, cuándo, desde dónde y
+        // con qué importes vigentes. No se espera — perder la prueba es malo,
+        // pero dejar a medias un pago ya autorizado es peor.
+        void recordConsent({
+          userId: ctx.user.id,
+          event: "payment",
+          ip: clientIpOf(ctx.req),
+          userAgent: String(ctx.req?.headers?.["user-agent"] ?? ""),
+          lang: input.lang ?? null,
+          textShown: input.consentText ?? null,
+          introCents: input.amountCents,
+          recurringCents,
+          trialHours,
+          provider: "apay",
+          sipayOrder: order,
+        });
+        await recordWebhookEvent({
+          provider: "sipay",
+          eventType: "apay_intro_charge",
+          eventId: txn || order,
+          status: "ok",
+          durationMs: Date.now() - startedAt,
+          payload: data,
+        });
+        try {
+          const acceptLang = String(ctx.req?.headers?.["accept-language"] ?? "").split(",")[0]?.split("-")[0] ?? "es";
+          // Guardar el idioma de la página en la que compró, para que lo que se
+          // le mande DESPUÉS (reenvío, soporte, aviso de impago) no acabe en
+          // castellano por defecto. Ver setUserLanguage en db.ts.
+          void setUserLanguage(ctx.user.id, input.lang || acceptLang);
+          const { sendTrialWelcomeEmail } = await import("./email");
+          const u = await getUserById(ctx.user.id);
+          if (u?.email) {
+            sendTrialWelcomeEmail({ to: u.email, name: u.name ?? u.email, lang: input.lang || acceptLang, trialEndDate: periodEnd })
+              .catch((err: any) => console.warn("[Sipay ApPay] welcome email failed:", err?.message ?? err));
+          }
+        } catch (err: any) {
+          console.warn("[Sipay ApPay] welcome email setup failed:", err?.message ?? err);
+        }
+        return {
+          transactionId: txn,
+          maskedCard: masked,
+          cardBrand: data?.payload?.card_brand ?? "",
+          order,
+          duplicate: false,
+        };
+        } finally {
+          // Released only after recordCharge has written the ledger row, so a
+          // request arriving right behind this one sees the charge in the DB.
+          guard.release();
+        }
+      }),
+
+    // Google Pay one-shot authorization. Front-end gets the encrypted token
+    // from Google's PaymentDataRequest, sends it here, and we forward it to
+    // Sipay /mdwr/v1/authorization with catcher.type="gpay". No 3DS redirect
+    // because Google already authenticated the buyer. After the charge clears
+    // we mirror the FastPay-callback DB writes so the user gets their sub
+    // row + welcome email regardless of which wallet they used.
+    sipayGpayCharge: protectedProcedure
+      .input(z.object({
+        token: z.string().min(50),
+        amountCents: z.number().int().positive(),
+        gclid: z.string().max(512).optional(),
+        gclidType: z.string().max(16).optional(),
+        lang: z.string().max(8).optional(),
+        // Code-190 forensics (logging only): the Google Pay credential type
+        // (PAN_ONLY vs CRYPTOGRAM_3DS) + network + raw assuranceDetails, so we
+        // can split wallet failures by credential and confirm the cryptogram
+        // path is the one Sipay/Redsys rejects. Does NOT affect the charge.
+        credType: z.string().max(24).optional(),
+        cardNetwork: z.string().max(24).optional(),
+        assurance: z.string().max(256).optional(),
+        // Frase de aceptación que el comprador tenía delante al autorizar.
+        consentText: z.string().max(1000).optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        // Idempotency + server-side price. See _core/altaGuard.ts.
+        const { openAltaGuard, recordAltaBlocked, recordAltaPriceMismatch } = await import("./_core/altaGuard");
+        const guard = await openAltaGuard(ctx.user.id);
+        if (!guard.ok) {
+          await recordAltaBlocked({
+            userId: ctx.user.id, method: "gpay", reason: guard.reason,
+            existingChargeId: guard.existing?.id, clientAmountCents: input.amountCents,
+          });
+          if (guard.reason === "already_paid" && guard.existing) {
+            return {
+              transactionId: guard.existing.sipayTransactionId ?? "",
+              maskedCard: guard.existing.sipayMaskedCard ?? "",
+              cardBrand: "",
+              order: guard.existing.sipayOrder ?? "",
+              duplicate: true,
+            };
+          }
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "Ya hay un pago en curso para esta cuenta. Espera unos segundos.",
+          });
+        }
+        if (input.amountCents !== guard.amountCents) {
+          await recordAltaPriceMismatch({
+            userId: ctx.user.id, method: "gpay",
+            clientAmountCents: input.amountCents, serverAmountCents: guard.amountCents,
+          });
+        }
+        const amountCents = guard.amountCents;
+        try {
+        const { chargeGpay } = await import("./_core/sipay");
+        const order = `gpay-${ctx.user.id}-${Date.now()}`;
+        const startedAt = Date.now();
+        const { recordWebhookEvent: recordEvtStart } = await import("./db");
+        await recordEvtStart({
+          provider: "sipay",
+          eventType: "gpay_init_started",
+          eventId: order,
+          status: "ok",
+          durationMs: 0,
+          payload: { userId: ctx.user.id, amountCents, lang: input.lang ?? null, credType: input.credType, cardNetwork: input.cardNetwork, assurance: input.assurance },
+        });
+        const result = await chargeGpay({
+          amountCents,
+          tokenGpay: input.token,
+          order,
+          token: `usr-${ctx.user.id}`,
+          custom_01: String(ctx.user.id),
+        });
+        const data = result.data as any;
+        const payloadCode = data?.payload?.code ?? data?.code;
+        if (!result.ok || payloadCode !== "0") {
+          const { recordWebhookEvent } = await import("./db");
+          await recordWebhookEvent({
+            provider: "sipay",
+            eventType: "gpay_charge_failed",
+            eventId: order,
+            status: "error",
+            errorMessage: data?.payload?.detail ?? data?.detail ?? "unknown",
+            durationMs: Date.now() - startedAt,
+            payload: { ...(data && typeof data === "object" ? data : { raw: result.raw }), credType: input.credType, cardNetwork: input.cardNetwork },
+          });
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `Sipay rechazó Google Pay: ${JSON.stringify(data ?? result.raw)}`,
+          });
+        }
+        const txn = data?.payload?.transaction_id ?? "";
+        const masked = data?.payload?.masked_card ?? "";
+        const { upsertSubscription, markDocumentsPaid, recordWebhookEvent, recordCharge, setUserCountryIfEmpty, setUserLanguage, getTrialHours } = await import("./db");
+        const now = new Date();
+        // 0,50 € intro buys a trial of site_settings.trial_hours. After it expires
+        // the cron picks the sub up and charges the MIT-R, which extends 30 days.
+        const trialHours = await getTrialHours();
+        const periodEnd = trialEndFrom(now, trialHours);
+        // Precio recurrente anclado a esta suscripción (ver el camino de Apple
+        // Pay): las subidas posteriores son solo para altas nuevas.
+        const recurringCents = Math.round((await getActiveMonthlyPrice()).eur * 100);
+        await upsertSubscription({
+          userId: ctx.user.id,
+          // Store the merchant token we vaulted the card under (`usr-<userId>`),
+          // NOT the cof_id — Sipay charges MIT-R against the merchant token, and
+          // rejects the cof_id with "no_card_from_token". Prefer the echoed
+          // token, fall back to the deterministic usr-<userId>.
+          sipayToken: data?.payload?.token ?? `usr-${ctx.user.id}`,
+          sipayOrder: order,
+          sipayTransactionId: txn,
+          sipayMaskedCard: masked,
+          sipayProvider: "gpay",
+          plan: "trial",
+          status: "trialing",
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd,
+          trialHours,
+          recurringCents,
+          cancelAtPeriodEnd: false,
+        });
+        await markDocumentsPaid(ctx.user.id);
+        // Persist payer country (Cloudflare geo) for revenue-by-country, first
+        // payment wins.
+        await setUserCountryIfEmpty(ctx.user.id, String(ctx.req?.headers?.["cf-ipcountry"] ?? ""));
+        await recordCharge({
+          userId: ctx.user.id,
+          provider: "gpay",
+          amountCents,
+          sipayTransactionId: txn,
+          sipayOrder: order,
+          sipayMaskedCard: masked,
+          status: "ok",
+          gclid: input.gclid,
+          gclidType: input.gclidType,
+          deviceType: deviceFromUA(String(ctx.req?.headers?.["user-agent"] ?? "")),
+          cardCountry: data?.payload?.card_country ?? null,
+          geoCountry: String(ctx.req?.headers?.["cf-ipcountry"] ?? ""),
+        });
+        // Prueba de consentimiento del cobro: qué aceptó, cuándo, desde dónde y
+        // con qué importes vigentes. No se espera — perder la prueba es malo,
+        // pero dejar a medias un pago ya autorizado es peor.
+        void recordConsent({
+          userId: ctx.user.id,
+          event: "payment",
+          ip: clientIpOf(ctx.req),
+          userAgent: String(ctx.req?.headers?.["user-agent"] ?? ""),
+          lang: input.lang ?? null,
+          textShown: input.consentText ?? null,
+          introCents: input.amountCents,
+          recurringCents,
+          trialHours,
+          provider: "gpay",
+          sipayOrder: order,
+        });
+        await recordWebhookEvent({
+          provider: "sipay",
+          eventType: "gpay_intro_charge",
+          eventId: txn || order,
+          status: "ok",
+          durationMs: Date.now() - startedAt,
+          payload: { ...data, credType: input.credType, cardNetwork: input.cardNetwork },
+        });
+        try {
+          const acceptLang = String(ctx.req?.headers?.["accept-language"] ?? "").split(",")[0]?.split("-")[0] ?? "es";
+          // Guardar el idioma de la página en la que compró, para que lo que se
+          // le mande DESPUÉS (reenvío, soporte, aviso de impago) no acabe en
+          // castellano por defecto. Ver setUserLanguage en db.ts.
+          void setUserLanguage(ctx.user.id, input.lang || acceptLang);
+          const { sendTrialWelcomeEmail } = await import("./email");
+          const u = await getUserById(ctx.user.id);
+          if (u?.email) {
+            sendTrialWelcomeEmail({ to: u.email, name: u.name ?? u.email, lang: input.lang || acceptLang, trialEndDate: periodEnd })
+              .catch((err: any) => console.warn("[Sipay GPay] welcome email failed:", err?.message ?? err));
+          }
+        } catch (err: any) {
+          console.warn("[Sipay GPay] welcome email setup failed:", err?.message ?? err);
+        }
+        return {
+          transactionId: txn,
+          maskedCard: masked,
+          cardBrand: data?.payload?.card_brand ?? "",
+          order,
+          duplicate: false,
+        };
+        } finally {
+          guard.release();
+        }
+      }),
+
+    // Phase 1 — wire FastPay token into all-in-one and return the 3DS URL
+    // the frontend must navigate to. No DB writes; the customer comes back
+    // through /api/sipay/callback/ok where we confirm and create the sub.
+    //
+    // We log an `fastpay_init_started` event up-front and a matching
+    // `_failed` if Sipay rejects, so the admin can see the FULL payment
+    // funnel (start → 3DS → confirm) and spot abandonment between steps.
+    sipayCheckoutInit: protectedProcedure
+      .input(z.object({
+        fastpayRequestId: z.string().min(8),
+        amountCents: z.number().int().positive(),
+        gclid: z.string().max(512).optional(),
+        gclidType: z.string().max(16).optional(),
+        lang: z.string().max(8).optional(),
+        // Frase de aceptación que el comprador tenía delante al autorizar.
+        consentText: z.string().max(1000).optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        // Idempotency + server-side price. See _core/altaGuard.ts.
+        //
+        // The card path differs from the wallets: money moves in the 3DS
+        // callback, not here. So the lock only covers this init call, and the
+        // real protection is the DB probe — which is enough, because in every
+        // duplicate we observed in production the FIRST card charge had already
+        // landed in `charges` before the second checkout was started (closest
+        // pair 2,3 min apart). A user whose first attempt was DECLINED has no
+        // charge row, so their retry is correctly allowed straight through.
+        const { openAltaGuard, recordAltaBlocked, recordAltaPriceMismatch } = await import("./_core/altaGuard");
+        const guard = await openAltaGuard(ctx.user.id);
+        if (!guard.ok) {
+          await recordAltaBlocked({
+            userId: ctx.user.id, method: "fastpay", reason: guard.reason,
+            existingChargeId: guard.existing?.id, clientAmountCents: input.amountCents,
+          });
+          if (guard.reason === "already_paid" && guard.existing) {
+            // No redirectUrl → the client must NOT send the buyer to 3DS again.
+            return {
+              requestId: "",
+              redirectUrl: "",
+              order: guard.existing.sipayOrder ?? "",
+              duplicate: true,
+            };
+          }
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "Ya hay un pago en curso para esta cuenta. Espera unos segundos.",
+          });
+        }
+        if (input.amountCents !== guard.amountCents) {
+          await recordAltaPriceMismatch({
+            userId: ctx.user.id, method: "fastpay",
+            clientAmountCents: input.amountCents, serverAmountCents: guard.amountCents,
+          });
+        }
+        const amountCents = guard.amountCents;
+        try {
+        const { createCheckoutFastpay } = await import("./_core/sipay");
+        const { recordWebhookEvent, setUserCountryIfEmpty } = await import("./db");
+        // Capture payer country here (direct browser request → reliable geo)
+        // for revenue-by-country; the 3DS callback also backfills it.
+        await setUserCountryIfEmpty(ctx.user.id, String(ctx.req?.headers?.["cf-ipcountry"] ?? ""));
+        const order = `sipay-${ctx.user.id}-${Date.now()}`;
+        const token = `usr-${ctx.user.id}`;
+        const startedAt = Date.now();
+        await recordWebhookEvent({
+          provider: "sipay",
+          eventType: "fastpay_init_started",
+          eventId: order,
+          status: "ok",
+          durationMs: 0,
+          // `lang` = la edición de idioma en la que compró. Se registra aquí
+          // para poder reconstruirlo después: hasta el 12-ago-2026 los eventos
+          // de wallet no lo guardaban y no quedaba rastro de en qué idioma
+          // había que escribir a ese cliente.
+          payload: { userId: ctx.user.id, amountCents, lang: input.lang ?? null },
+        });
+        const result = await createCheckoutFastpay({
+          amountCents,
+          fastpayRequestId: input.fastpayRequestId,
+          token,
+          order,
+          url_ok: "https://pdfeditoronline.net/api/sipay/callback/ok",
+          url_ko: "https://pdfeditoronline.net/api/sipay/callback/ko",
+          custom_01: String(ctx.user.id),
+        });
+        const data = result.data as any;
+        if (!result.ok || data?.code !== "0") {
+          await recordWebhookEvent({
+            provider: "sipay",
+            eventType: "fastpay_init_failed",
+            eventId: order,
+            status: "error",
+            errorMessage: data?.detail ?? data?.description ?? "unknown",
+            durationMs: Date.now() - startedAt,
+            payload: data ?? result.raw,
+          });
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `Sipay rechazó la petición: ${JSON.stringify(data ?? result.raw)}`,
+          });
+        }
+
+        // Reconciliation marker — we sent this user to Redsys MPI with the
+        // request_id below. If the redirect to /api/sipay/callback/ok never
+        // fires (closed tab, network drop, MPI redirect failure), the cron
+        // at /api/cron/sipay-finalize-pending scans these events and
+        // re-confirms with Sipay so we don't end up with orphan charges.
+        const sipayRequestId: string = data?.payload?.request_id ?? "";
+        await recordWebhookEvent({
+          provider: "sipay",
+          eventType: "fastpay_3ds_pending",
+          eventId: order,
+          status: "ok",
+          durationMs: Date.now() - startedAt,
+          payload: {
+            userId: ctx.user.id,
+            order,
+            requestId: sipayRequestId,
+            amountCents,
+            ...(input.lang ? { lang: input.lang } : {}),
+            ...(input.gclid ? { gclid: input.gclid, gclidType: input.gclidType ?? "gclid" } : {}),
+            // Datos del COMPRADOR para la prueba de consentimiento. Se anotan
+            // aquí porque el cobro de tarjeta se cierra en el callback del 3DS,
+            // que llega desde Redsys: allí la IP y el navegador ya no son los
+            // suyos y no valdrían como prueba.
+            ip: clientIpOf(ctx.req),
+            userAgent: String(ctx.req?.headers?.["user-agent"] ?? "").slice(0, 512),
+            ...(input.consentText ? { consentText: input.consentText } : {}),
+          },
+        });
+
+        return {
+          requestId: sipayRequestId,
+          redirectUrl: data?.payload?.url ?? "",
+          order,
+          duplicate: false,
+        };
+        } finally {
+          guard.release();
+        }
+      }),
+
+  }),
+
+  // ─── Documents ─────────────────────────────────────────────────
+  documents: router({
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return getDocumentsByUserId(ctx.user.id);
+    }),
+
+    get: protectedProcedure
+      .input(z.object({ id: z.number() }))
+      .query(async ({ ctx, input }) => {
+        return getDocumentById(input.id, ctx.user.id);
+      }),
+
+    upload: protectedProcedure
+      .input(
+        z.object({
+          name: z.string(),
+          base64: z.string(),
+          size: z.number(),
+          folderId: z.number().optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        const buffer = Buffer.from(input.base64, "base64");
+        const key = `docs/${ctx.user.id}/${Date.now()}-${input.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+        const { url } = await storagePut(key, buffer, "application/pdf");
+        const doc = await createDocument({
+          userId: ctx.user.id,
+          name: input.name,
+          fileKey: key,
+          fileUrl: url,
+          fileSize: input.size,
+          folderId: input.folderId,
+        });
+        return doc;
+      }),
+
+    rename: protectedProcedure
+      .input(z.object({ id: z.number(), name: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        await updateDocument(input.id, ctx.user.id, { name: input.name });
+        return { success: true };
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deleteDocument(input.id, ctx.user.id);
+        return { success: true };
+      }),
+  }),
+
+  // ─── Folders ───────────────────────────────────────────────────
+  folders: router({
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return getFoldersByUserId(ctx.user.id);
+    }),
+
+    create: protectedProcedure
+      .input(z.object({ name: z.string().min(1).max(256) }))
+      .mutation(async ({ ctx, input }) => {
+        return createFolder(ctx.user.id, input.name);
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deleteFolder(input.id, ctx.user.id);
+        return { success: true };
+      }),
+  }),
+
+  // ─── Team ──────────────────────────────────────────────────────
+  team: router({
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return getTeamInvitations(ctx.user.id);
+    }),
+
+    invite: protectedProcedure
+      .input(
+        z.object({
+          email: z.string().email(),
+          role: z.enum(["editor", "viewer", "admin"]).default("editor"),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        await createTeamInvitation({
+          ownerId: ctx.user.id,
+          inviteeEmail: input.email,
+          role: input.role,
+        });
+        return { success: true };
+      }),
+
+    remove: protectedProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await removeTeamInvitation(input.id, ctx.user.id);
+        return { success: true };
+      }),
+  }),
+
+  // ─── Contact ───────────────────────────────────────────────────
+  contact: router({
+    send: publicProcedure
+      .input(
+        z.object({
+          name: z.string().min(1).max(128),
+          email: z.string().email(),
+          reason: z.string().max(128).optional(),
+          subject: z.string().min(1).max(256),
+          message: z.string().min(1).max(5000),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        await createContactMessage({
+          userId: ctx.user?.id,
+          name: input.name,
+          email: input.email,
+          reason: input.reason ?? "",
+          subject: input.subject,
+          message: input.message,
+        });
+        return { success: true };
+      }),
+  }),
+
+  // ─── Legal Pages ───────────────────────────────────────────────
+  legal: router({
+    get: publicProcedure
+      .input(z.object({ slug: z.string() }))
+      .query(async ({ input }) => {
+        const page = await getLegalPage(input.slug);
+        if (!page) return page;
+        // Interpolate {price} placeholder so legal pages reflect the live
+        // subscription price. Existing seeded pages with hardcoded "19,99 EUR"
+        // are unaffected (no placeholder = no replacement); when admin edits
+        // them via the panel they can switch to {price} to make them dynamic.
+        const { getActiveMonthlyPrice } = await import("./db");
+        const { formatted } = await getActiveMonthlyPrice();
+        const interpolate = (s: string | null | undefined) =>
+          s ? s.replace(/\{price\}/g, formatted) : s ?? "";
+        return {
+          ...page,
+          title: interpolate(page.title) ?? page.title,
+          content: interpolate(page.content),
+        };
+      }),
+
+    list: publicProcedure.query(async () => {
+      return getAllLegalPages();
+    }),
+  }),
+
+  // ─── Admin ─────────────────────────────────────────────────────
+  admin: router({
+    stats: adminProcedure.query(async () => {
+      return getAdminStats();
+    }),
+
+    // Bloque "Conversión de trial a suscripción". Cálculos puros + testeados en
+    // server/_core/trialConversion.ts; datos vía getTrialConversionRows (UTC).
+    trialConversion: adminProcedure.query(async () => {
+      const { getTrialConversionRows, getActiveMonthlyPrice } = await import("./db");
+      const { buildCycles, block1, block2, block3 } = await import("./_core/trialConversion");
+      const [{ subs, charges }, price] = await Promise.all([getTrialConversionRows(), getActiveMonthlyPrice()]);
+      const nowMs = Date.now();
+      const currentAmountCents = Math.round(price.eur * 100);
+      return {
+        currentAmountCents,
+        priceEur: price.eur,
+        block1: block1(buildCycles(charges as any), { currentAmountCents, nowMs }),
+        block2: block2(subs as any, { nowMs }),
+        block3: block3(subs as any, { nowMs, windowDays: 30 }),
+      };
+    }),
+
+    // Resumen para la vista móvil del admin (hoy + últimos cobros/fallos).
+    mobileSummary: adminProcedure.query(async () => {
+      const { getAdminMobileSummary } = await import("./db");
+      return getAdminMobileSummary();
+    }),
+
+    sipayProbe: adminProcedure.mutation(async () => {
+      const { probeSandbox } = await import("./_core/sipay");
+      const result = await probeSandbox({
+        url_ok: "https://pdfeditoronline.net/sipay/callback/ok",
+        url_ko: "https://pdfeditoronline.net/sipay/callback/ko",
+      });
+      return {
+        ok: result.ok,
+        httpStatus: result.httpStatus,
+        endpoint: result.endpoint,
+        data: result.data,
+        raw: result.raw,
+        signature: result.signature,
+        requestBody: result.requestBody,
+      };
+    }),
+
+    // Diagnostic — verify a user's stored token resolves to a chargeable card
+    // (i.e. whether their subscription will renew via MIT-R). NO charge.
+    checkWalletToken: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ input }) => {
+        const { checkCardToken } = await import("./_core/sipay");
+        const { getActiveSubscription } = await import("./db");
+        const sub = await getActiveSubscription(input.userId);
+        const token = sub?.sipayToken ?? "";
+        if (!token) return { token: "", resolved: false, detail: "sub sin token o sin sub activa", raw: "" };
+        const result = await checkCardToken(token);
+        const data: any = result.data;
+        const resolved = !!result.ok && data?.code === "0";
+        return {
+          token,
+          resolved,
+          detail: data?.detail ?? data?.description ?? "",
+          raw: (result.raw ?? "").slice(0, 300),
+        };
+      }),
+
+    users: adminProcedure
+      .input(z.object({ search: z.string().optional() }))
+      .query(async ({ input }) => {
+        return getAllUsers(input.search);
+      }),
+
+    subscribedUsers: adminProcedure.query(async () => {
+      return getAllSubscribedUsers();
+    }),
+
+    deactivateUser: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deactivateUser(input.userId);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "deactivate_user",
+          targetType: "user",
+          targetId: String(input.userId),
+        });
+        return { success: true };
+      }),
+
+    deleteUser: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deleteUserById(input.userId);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "delete_user",
+          targetType: "user",
+          targetId: String(input.userId),
+        });
+        return { success: true };
+      }),
+
+    // Admin-initiated subscription cancellation: stops the MIT-R renewal
+    // (cancelAtPeriodEnd = true) while the user keeps service until the period
+    // ends — same behaviour as the user cancelling from their dashboard.
+    cancelUserSubscription: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await cancelSubscriptionDb(input.userId);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "cancel_subscription",
+          targetType: "user",
+          targetId: String(input.userId),
+        });
+        return { success: true };
+      }),
+
+    contactMessages: adminProcedure.query(async () => {
+      return getAllContactMessages();
+    }),
+
+    markMessageRead: adminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        await markContactMessageRead(input.id);
+        return { success: true };
+      }),
+
+    deleteMessage: adminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deleteContactMessage(input.id);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "delete_contact_message",
+          targetType: "contact_message",
+          targetId: String(input.id),
+        });
+        return { success: true };
+      }),
+
+    bulkDeleteMessages: adminProcedure
+      .input(z.object({ ids: z.array(z.number()).min(1).max(500) }))
+      .mutation(async ({ ctx, input }) => {
+        const n = await deleteContactMessages(input.ids);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "bulk_delete_contact_messages",
+          targetType: "contact_message",
+          targetId: input.ids.join(","),
+          metadata: { count: n },
+        });
+        return { success: true, count: n };
+      }),
+
+    bulkArchiveMessages: adminProcedure
+      .input(z.object({ ids: z.array(z.number()).min(1).max(500), archived: z.boolean() }))
+      .mutation(async ({ ctx, input }) => {
+        const n = await setContactMessagesArchived(input.ids, input.archived);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: input.archived ? "bulk_archive_contact_messages" : "bulk_unarchive_contact_messages",
+          targetType: "contact_message",
+          targetId: input.ids.join(","),
+          metadata: { count: n },
+        });
+        return { success: true, count: n };
+      }),
+
+    /**
+     * Send a reply to a contact-form message and stamp `repliedAt` so the
+     * UI can show it was answered. Body is mandatory; we trim it to keep
+     * empty replies out of the audit log.
+     */
+    /**
+     * Borrador de respuesta a una queja, con los datos reales del cliente.
+     *
+     * NO envía nada: devuelve texto para que el admin lo lea, lo corrija y
+     * decida. Ver server/_core/supportDraft.ts.
+     */
+    draftReply: adminProcedure
+      .input(z.object({ id: z.number() }))
+      .query(async ({ input }) => {
+        const msg = await getContactMessageById(input.id);
+        if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Mensaje no encontrado" });
+        const { getUserByEmail, getConsentsForUser, getChargesForUser, getActiveSubscription } = await import("./db");
+        const { classifyComplaint, buildSupportDraft } = await import("./_core/supportDraft");
+
+        const user = await getUserByEmail(msg.email);
+        const charges = user ? await getChargesForUser(user.id) : [];
+        const consents = user ? await getConsentsForUser(user.id) : [];
+        const sub = user ? await getActiveSubscription(user.id) : null;
+        // El primer cargo marca el inicio del plazo de desistimiento.
+        const primerCargo = charges.length ? new Date(charges[charges.length - 1].createdAt) : null;
+        const kind = classifyComplaint(msg.message ?? "", primerCargo);
+
+        const draft = buildSupportDraft(kind, {
+          name: msg.name ?? null,
+          email: msg.email,
+          message: msg.message ?? "",
+          lang: (user?.language || "es").slice(0, 2),
+          charges: charges.map((c) => ({
+            amountCents: c.amountCents, createdAt: c.createdAt,
+            status: c.status, refundedCents: c.refundedCents,
+          })),
+          consents: consents.map((c) => ({
+            event: c.event, createdAt: c.createdAt, ip: c.ip,
+            lang: c.lang, textShown: c.textShown,
+          })),
+          trialEnd: sub?.currentPeriodEnd ?? null,
+          trialHours: (sub as any)?.trialHours ?? null,
+          // El correo de bienvenida sale justo tras el alta; su marca temporal
+          // es la del primer cargo, que es lo que dispara el envío.
+          welcomeSentAt: primerCargo,
+        });
+
+        const dias = primerCargo
+          ? Math.floor((Date.now() - primerCargo.getTime()) / (24 * 3600 * 1000))
+          : null;
+        return {
+          kind,
+          draft,
+          lang: (user?.language || "es").slice(0, 2),
+          diasDesdeCompra: dias,
+          tieneConsentimiento: consents.length > 0,
+          usuarioEncontrado: !!user,
+          userId: user?.id ?? null,
+          charges: charges.map((c) => ({
+            id: c.id, amountCents: c.amountCents, createdAt: c.createdAt,
+            status: c.status, provider: c.provider,
+            sipayTransactionId: c.sipayTransactionId,
+          })),
+        };
+      }),
+
+    replyToMessage: adminProcedure
+      .input(z.object({ id: z.number(), body: z.string().min(1).max(5000) }))
+      .mutation(async ({ ctx, input }) => {
+        const msg = await getContactMessageById(input.id);
+        if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Mensaje no encontrado" });
+        const trimmed = input.body.trim();
+        if (!trimmed) throw new TRPCError({ code: "BAD_REQUEST", message: "Respuesta vacía" });
+
+        const { sendContactReplyEmail } = await import("./email");
+        const sent = await sendContactReplyEmail({
+          to: msg.email,
+          toName: msg.name,
+          originalSubject: msg.subject,
+          originalMessage: msg.message,
+          replyBody: trimmed,
+        });
+        if (!sent) {
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: "No se pudo enviar el email. Revisa que RESEND_API_KEY esté configurada.",
+          });
+        }
+        await markContactMessageReplied(input.id, trimmed);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "reply_contact_message",
+          targetType: "contact_message",
+          targetId: String(input.id),
+          metadata: { to: msg.email, length: trimmed.length },
+        });
+        return { success: true };
+      }),
+
+    // ── Email templates (canned replies for contact_messages) ──
+    emailTemplates: adminProcedure.query(async () => {
+      return getEmailTemplates();
+    }),
+
+    createEmailTemplate: adminProcedure
+      .input(z.object({ name: z.string().min(1).max(128), body: z.string().min(1).max(5000) }))
+      .mutation(async ({ ctx, input }) => {
+        await createEmailTemplate(input);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "create_email_template",
+          targetType: "email_template",
+          targetId: input.name,
+        });
+        return { success: true };
+      }),
+
+    updateEmailTemplate: adminProcedure
+      .input(z.object({ id: z.number(), name: z.string().min(1).max(128), body: z.string().min(1).max(5000) }))
+      .mutation(async ({ ctx, input }) => {
+        await updateEmailTemplate(input.id, { name: input.name, body: input.body });
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "update_email_template",
+          targetType: "email_template",
+          targetId: String(input.id),
+        });
+        return { success: true };
+      }),
+
+    deleteEmailTemplate: adminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deleteEmailTemplate(input.id);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "delete_email_template",
+          targetType: "email_template",
+          targetId: String(input.id),
+        });
+        return { success: true };
+      }),
+
+    legalPages: adminProcedure.query(async () => {
+      return getAllLegalPages();
+    }),
+
+    saveLegalPage: adminProcedure
+      .input(
+        z.object({
+          slug: z.string(),
+          title: z.string().min(1),
+          content: z.string(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await upsertLegalPage(input.slug, input.title, input.content);
+        return { success: true };
+      }),
+
+    settings: adminProcedure.query(async () => {
+      return getAllSiteSettings();
+    }),
+
+    saveSetting: adminProcedure
+      .input(z.object({ key: z.string(), value: z.string() }))
+      .mutation(async ({ ctx, input }) => {
+        await setSiteSetting(input.key, input.value);
+        // Audit-log price-impacting changes — they affect what new customers
+        // pay, so we want a record of who flipped them and when.
+        if (input.key === "subscription_price_eur") {
+          await recordAuditEntry({
+            adminId: ctx.user.id,
+            adminEmail: ctx.user.email ?? null,
+            action: "update_pricing",
+            targetType: "site_setting",
+            targetId: input.key,
+            metadata: { value: input.value },
+          });
+        }
+        return { success: true };
+      }),
+
+    billingStats: adminProcedure
+      .input(
+        z.object({
+          from: z.string().datetime().optional(),
+          to: z.string().datetime().optional(),
+        }).optional()
+      )
+      .query(async ({ input }) => {
+        const t0 = Date.now();
+        const from = input?.from ? new Date(input.from) : undefined;
+        const to = input?.to ? new Date(input.to) : undefined;
+        try {
+          const result = await getBillingStats({ from, to });
+          console.log(`[admin.billingStats] OK in ${Date.now() - t0}ms (range: ${from?.toISOString()} → ${to?.toISOString()})`);
+          return result;
+        } catch (err) {
+          console.error(`[admin.billingStats] FAILED after ${Date.now() - t0}ms:`, err);
+          throw err;
+        }
+      }),
+
+    revenue: adminProcedure
+      .input(z.object({
+        from: z.string().datetime(),
+        to: z.string().datetime(),
+      }))
+      .query(async ({ input }) => {
+        const t0 = Date.now();
+        try {
+          const result = await getRevenue({
+            from: new Date(input.from),
+            to: new Date(input.to),
+          });
+          console.log(`[admin.revenue] OK in ${Date.now() - t0}ms (charges: ${result.chargesCount})`);
+          return result;
+        } catch (err) {
+          console.error(`[admin.revenue] FAILED after ${Date.now() - t0}ms:`, err);
+          throw err;
+        }
+      }),
+
+    dailyIntroCharges: adminProcedure
+      .input(z.object({
+        from: z.string().datetime(),
+        to: z.string().datetime(),
+      }))
+      .query(async ({ input }) => {
+        return getDailyIntroCharges({
+          from: new Date(input.from),
+          to: new Date(input.to),
+        });
+      }),
+
+    canceledSubscriptions: adminProcedure.query(async () => {
+      return getCanceledSubscriptions();
+    }),
+
+    subsAboutToCancel: adminProcedure.query(async () => {
+      return getSubsAboutToCancel();
+    }),
+
+    pastDueSubs: adminProcedure.query(async () => {
+      return getPastDueSubs();
+    }),
+
+    recentSubsWithoutPayment: adminProcedure
+      .input(z.object({ hours: z.number().int().min(1).max(168).optional() }).optional())
+      .query(async ({ input }) => {
+        return getRecentSubsWithoutPayment({ hours: input?.hours });
+      }),
+
+    documents: adminProcedure
+      .input(z.object({ search: z.string().optional(), limit: z.number().optional() }).optional())
+      .query(async ({ input }) => {
+        return getAllDocuments({ search: input?.search, limit: input?.limit });
+      }),
+
+    storageByUser: adminProcedure.query(async () => {
+      return getStorageByUser();
+    }),
+
+    charges: adminProcedure
+      .input(z.object({ limit: z.number().optional() }).optional())
+      .query(async ({ input }) => {
+        return getChargesList({ limit: input?.limit });
+      }),
+
+    // Charges carrying a Google Ads click ID → offline conversion CSV export.
+    gclidConversions: adminProcedure.query(async () => {
+      return getGclidConversions({ days: 90 });
+    }),
+
+    refundCharge: adminProcedure
+      .input(z.object({
+        chargeId: z.string().min(1),
+        amountEur: z.number().positive().optional(),
+        reason: z.enum(["duplicate", "fraudulent", "requested_by_customer"]).optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        const result = await refundCharge(input);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "refund_charge",
+          targetType: "charge",
+          targetId: input.chargeId,
+          metadata: { amountEur: result.amountEur, reason: input.reason },
+        });
+        return result;
+      }),
+
+    // ── Orphan FastPay recovery (manual one-shot) ─────────────
+    // When the redirect callback never fires but Sipay charged the card,
+    // the admin can paste the request_id (from the Sipay dashboard) +
+    // the userId here and we'll re-run finalizeFastpayPayment exactly as
+    // the redirect would. Idempotent so it's safe to run twice.
+    recoverOrphanPayment: adminProcedure
+      .input(z.object({
+        requestId: z.string().min(4),
+        userId: z.number().int().positive(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        const { finalizeFastpayPayment } = await import("./_core/sipay");
+        const result = await finalizeFastpayPayment({
+          requestId: input.requestId,
+          fallbackUserId: input.userId,
+          source: "admin",
+        });
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "recover_orphan_payment",
+          targetType: "user",
+          targetId: String(input.userId),
+          metadata: { requestId: input.requestId, result },
+        });
+        return result;
+      }),
+
+    // ── Listado de pagos huérfanos pendientes de reconciliación ─
+    // Returns the same set the cron processes — used to surface an
+    // "N pagos pendientes" badge + a "Reconciliar ahora" button in the
+    // admin panel.
+    pendingOrphanPayments: adminProcedure
+      .input(z.object({ hoursBack: z.number().optional() }).optional())
+      .query(async ({ input }) => {
+        const { findPendingFastpayPayments } = await import("./db");
+        return findPendingFastpayPayments({ hoursBack: input?.hoursBack ?? 24, limit: 100 });
+      }),
+
+    // ── Webhook event log (F2) ────────────────────────────────
+    webhookEvents: adminProcedure
+      .input(z.object({
+        limit: z.number().optional(),
+        type: z.string().optional(),
+        status: z.enum(["ok", "error"]).optional(),
+      }).optional())
+      .query(async ({ input }) => {
+        return getWebhookEvents({ limit: input?.limit, type: input?.type, status: input?.status });
+      }),
+
+    // ── Audit log (S1) ────────────────────────────────────────
+    auditLog: adminProcedure
+      .input(z.object({ limit: z.number().optional() }).optional())
+      .query(async ({ input }) => {
+        return getAuditLog({ limit: input?.limit });
+      }),
+
+    // ── User notes (U3) ───────────────────────────────────────
+    updateUserNotes: adminProcedure
+      .input(z.object({ userId: z.number(), notes: z.string() }))
+      .mutation(async ({ ctx, input }) => {
+        await setUserAdminNotes(input.userId, input.notes);
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "update_user_notes",
+          targetType: "user",
+          targetId: String(input.userId),
+          metadata: { length: input.notes.length },
+        });
+        return { success: true };
+      }),
+
+    // ── Cancel reasons (F4) ───────────────────────────────────
+    cancelReasons: adminProcedure.query(async () => {
+      return getCancelReasonsAgg();
+    }),
+
+    // ── Geography of MRR (A4) ─────────────────────────────────
+    revenueByCountry: adminProcedure.query(async () => {
+      return getRevenueByCountry();
+    }),
+
+    // ── User 360° timeline (U1) ──────────────────────────────
+    userTimeline: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .query(async ({ input }) => {
+        return getUserTimeline(input.userId);
+      }),
+
+    /**
+     * Expediente de consentimiento de un cliente, para responder a un banco.
+     *
+     * Devuelve qué aceptó, cuándo, desde qué IP y navegador, en qué idioma, con
+     * qué importes vigentes — y el texto íntegro de los Términos tal y como
+     * estaban ESE día, no como están hoy.
+     */
+    consentDossier: adminProcedure
+      .input(z.object({ email: z.string().email() }))
+      .query(async ({ input }) => {
+        const { getUserByEmail, getConsentsForUser, getLegalSnapshot, getChargesForUser } = await import("./db");
+        const user = await getUserByEmail(input.email);
+        if (!user) return { found: false as const };
+        const consents = await getConsentsForUser(user.id);
+        // Un solo snapshot suele cubrir todos los consentimientos del cliente;
+        // se piden una vez por hash distinto en vez de uno por fila.
+        const hashes = Array.from(new Set(consents.map((c) => c.termsHash).filter(Boolean))) as string[];
+        const snapshots = Object.fromEntries(
+          (await Promise.all(hashes.map(async (h) => [h, await getLegalSnapshot(h)] as const)))
+            .filter(([, v]) => v),
+        );
+        return {
+          found: true as const,
+          user: { id: user.id, email: user.email, name: user.name, createdAt: user.createdAt, language: user.language },
+          consents,
+          snapshots,
+          charges: await getChargesForUser(user.id),
+        };
+      }),
+
+    // ── Live visitors counter (real-time, in-memory) ──────────
+    // Returns the number of distinct sessions that have pinged
+    // /api/presence/ping in the last 60 s, plus a top-paths
+    // breakdown so the admin can see which page is hot right now.
+    liveVisitors: adminProcedure.query(async () => {
+      const { activeBreakdown } = await import("./_core/presence");
+      return activeBreakdown();
+    }),
+
+    // ── Health checks (O1) ────────────────────────────────────
+    healthChecks: adminProcedure.query(async () => {
+      return getHealthChecks();
+    }),
+
+    // ── Admin self-test: reset / simulate trial usage ────────
+    resetMyTrialUsage: adminProcedure.mutation(async ({ ctx }) => {
+      const { resetMyTrialUsage } = await import("./db");
+      const r = await resetMyTrialUsage(ctx.user.id);
+      await recordAuditEntry({
+        adminId: ctx.user.id,
+        adminEmail: ctx.user.email ?? null,
+        action: "test_reset_trial_usage",
+        targetType: "user",
+        targetId: String(ctx.user.id),
+        metadata: { affected: r.affected },
+      });
+      return r;
+    }),
+    simulateTrialLimitReached: adminProcedure.mutation(async ({ ctx }) => {
+      const { simulateTrialLimitReached } = await import("./db");
+      const r = await simulateTrialLimitReached(ctx.user.id);
+      await recordAuditEntry({
+        adminId: ctx.user.id,
+        adminEmail: ctx.user.email ?? null,
+        action: "test_simulate_trial_limit",
+        targetType: "user",
+        targetId: String(ctx.user.id),
+        metadata: { stamped: r.stamped },
+      });
+      return r;
+    }),
+
+    // Solo QA: crea una suscripción de prueba en la base, sin cobrar, para que el admin
+    // test the download gate end-to-end without paying €0,50.
+    createFakeTrialSub: adminProcedure.mutation(async ({ ctx }) => {
+      const { createFakeTrialSub } = await import("./db");
+      const r = await createFakeTrialSub(ctx.user.id);
+      await recordAuditEntry({
+        adminId: ctx.user.id,
+        adminEmail: ctx.user.email ?? null,
+        action: "test_create_fake_trial_sub",
+        targetType: "user",
+        targetId: String(ctx.user.id),
+        metadata: r,
+      });
+      return r;
+    }),
+    deleteFakeTrialSub: adminProcedure.mutation(async ({ ctx }) => {
+      const { deleteFakeTrialSub } = await import("./db");
+      const r = await deleteFakeTrialSub(ctx.user.id);
+      await recordAuditEntry({
+        adminId: ctx.user.id,
+        adminEmail: ctx.user.email ?? null,
+        action: "test_delete_fake_trial_sub",
+        targetType: "user",
+        targetId: String(ctx.user.id),
+        metadata: { affected: r.affected },
+      });
+      return r;
+    }),
+
+    // coupon objects. If we want promo codes again we'll model them in our
+    // own DB and apply discounts client-side at checkout.
+
+    promoteUser: adminProcedure
+      .input(z.object({ userId: z.number(), role: z.enum(["user", "admin"]) }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await import("./db").then(m => m.getDb());
+        if (!db) return { success: false };
+        const { users } = await import("../drizzle/schema");
+        const { eq } = await import("drizzle-orm");
+        await db.update(users).set({ role: input.role }).where(eq(users.id, input.userId));
+        await recordAuditEntry({
+          adminId: ctx.user.id,
+          adminEmail: ctx.user.email ?? null,
+          action: "promote_user",
+          targetType: "user",
+          targetId: String(input.userId),
+          metadata: { newRole: input.role },
+        });
+        return { success: true };
+      }),
+
+    // ─── Blog Admin ───────────────────────────────────────────
+    blogPosts: adminProcedure.query(async () => {
+      return getBlogPosts(false); // all posts including drafts
+    }),
+    createBlogPost: adminProcedure
+      .input(z.object({
+        slug: z.string().min(1),
+        title: z.string().min(1),
+        excerpt: z.string().min(1),
+        content: z.string().min(1),
+        metaTitle: z.string().optional(),
+        metaDescription: z.string().optional(),
+        category: z.string().default("guides"),
+        tags: z.string().optional(),
+        readTime: z.number().default(5),
+        published: z.boolean().default(false),
+      }))
+      .mutation(async ({ input }) => {
+        return createBlogPost(input);
+      }),
+    updateBlogPost: adminProcedure
+      .input(z.object({
+        id: z.number(),
+        slug: z.string().optional(),
+        title: z.string().optional(),
+        excerpt: z.string().optional(),
+        content: z.string().optional(),
+        metaTitle: z.string().optional(),
+        metaDescription: z.string().optional(),
+        category: z.string().optional(),
+        tags: z.string().optional(),
+        readTime: z.number().optional(),
+        published: z.boolean().optional(),
+      }))
+      .mutation(async ({ input }) => {
+        const { id, ...data } = input;
+        return updateBlogPost(id, data);
+      }),
+    deleteBlogPost: adminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        await deleteBlogPost(input.id);
+        return { success: true };
+      }),
+    getBlogPost: adminProcedure
+      .input(z.object({ id: z.number() }))
+      .query(async ({ input }) => {
+        return getBlogPostById(input.id);
+      }),
+    uploadBlogImage: adminProcedure
+      .input(z.object({ base64: z.string(), filename: z.string() }))
+      .mutation(async ({ input }) => {
+        const matches = input.base64.match(/^data:([A-Za-z-+/]+);base64,(.+)$/);
+        if (!matches) throw new TRPCError({ code: "BAD_REQUEST", message: "Invalid base64" });
+        const contentType = matches[1];
+        const buffer = Buffer.from(matches[2], "base64");
+        const ext = input.filename.split(".").pop() ?? "jpg";
+        const key = `blog-images/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+        const { url } = await storagePut(key, buffer, contentType);
+        return { url };
+      }),
+  }),
+
+  // ─── Public Blog ───────────────────────────────────────────
+  blog: router({
+    list: publicProcedure.query(async () => {
+      return getBlogPosts(true);
+    }),
+    post: publicProcedure
+      .input(z.object({ slug: z.string() }))
+      .query(async ({ input }) => {
+        const post = await getBlogPost(input.slug);
+        if (!post || !post.published) throw new TRPCError({ code: "NOT_FOUND" });
+        return post;
+      }),
+  }),
+});
+export type AppRouter = typeof appRouter;
