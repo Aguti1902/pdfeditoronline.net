@@ -12,6 +12,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   gpay: "Google Pay",
   apay: "Apple Pay",
   mit: "Renovación mensual",
+  stripe: "Stripe",
 };
 
 const eur = (cents: number) => (cents / 100).toFixed(2).replace(".", ",") + " €";
@@ -25,6 +26,9 @@ const eur = (cents: number) => (cents / 100).toFixed(2).replace(".", ",") + " �
 export function saleLabels(provider: string, order?: string | null): { method: string; kind: string } {
   const isUpgrade = provider === "mit" && (order || "").startsWith("mit-upgrade-");
   if (isUpgrade) return { method: "Upgrade a mensual", kind: "⬆️ Desde trial" };
+  if (provider === "stripe" && (order || "").startsWith("renewal-")) {
+    return { method: "Stripe", kind: "🔄 Renovación" };
+  }
   const method = PROVIDER_LABEL[provider] ?? provider;
   const kind = provider === "mit" ? "🔄 Renovación" : "🆕 Alta nueva";
   return { method, kind };

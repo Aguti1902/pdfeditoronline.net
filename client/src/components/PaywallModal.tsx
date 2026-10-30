@@ -366,6 +366,32 @@ function SipayCheckoutForm({
   // retry the same token (one-shot). Without this, the effect re-fired on
   // every setRedirecting(false) → infinite loop spamming Sipay.
   const triedFastpayIdRef = useRef<string | null>(null);
+  const stripeCheckout = trpc.subscription.stripeCheckout.useMutation();
+  const [stripeError, setStripeError] = useState<string | null>(null);
+
+  async function startStripeCheckout() {
+    setStripeError(null);
+    const gc = getStoredGclid();
+    try {
+      const res = await stripeCheckout.mutateAsync({
+        lang,
+        origin: window.location.origin,
+        gclid: gc?.id,
+        gclidType: gc?.type,
+      });
+      if (res.alreadyPaid) {
+        window.location.href = `/payment/success?txn=${encodeURIComponent(res.txn || "")}&provider=stripe`;
+        return;
+      }
+      if (res.url) {
+        stashPendingCheckout();
+        window.location.href = res.url;
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "";
+      setStripeError(message || (lang === "es" ? "No se pudo abrir el pago. Inténtalo de nuevo." : "Couldn't open checkout. Please try again."));
+    }
+  }
 
   // Wallet → card fallback: always expand the FastPay card form (reusing the
   // same fresh-bundle reload as a normal open) so the buyer is never stuck. The
@@ -385,6 +411,8 @@ function SipayCheckoutForm({
   //    created" state across modal close/reopen and refuses to recreate the
   //    iframe on the second open, leaving the form empty.
   useEffect(() => {
+    // Card payments go through Stripe Checkout. The Sipay iframe stays unloaded.
+    if (true as boolean) return;
     if (!sipayConfigQ.data?.bundleUrl) return;
     (window as any).DONT_AUTOLOAD_FPAY = true;
 
@@ -669,11 +697,32 @@ function SipayCheckoutForm({
             </div>
           </div>
 
-          {/* FastPay button + loading + redirect overlay */}
-          {!sipayConfigQ.data?.key && (
-            <p className="text-sm text-gray-500 text-center">Cargando configuración…</p>
+          <button
+            type="button"
+            onClick={() => { void startStripeCheckout(); }}
+            disabled={stripeCheckout.isPending}
+            className="flex items-center justify-center gap-2.5 w-full px-4 rounded-xl text-white transition-all hover:brightness-95 disabled:opacity-70"
+            style={{ height: 52, background: "#E63946", boxShadow: "0 6px 16px -8px rgba(230,57,70,0.7)" }}
+          >
+            {stripeCheckout.isPending ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <CreditCard className="w-5 h-5 flex-shrink-0" />
+            )}
+            <span className="text-[15px] font-semibold">
+              {lang === "es" ? `Pagar ${introPrice} y descargar` : `Pay ${introPrice} and download`}
+            </span>
+          </button>
+          {stripeError && (
+            <p className="text-xs text-center text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{stripeError}</p>
           )}
-          {sipayConfigQ.data?.key && (
+          <p className="text-[11px] text-center text-slate-500 leading-snug">
+            {lang === "es"
+              ? "Tarjeta, Apple Pay o Google Pay. El cobro de hoy es el de alta. La cuota mensual empieza al terminar la prueba."
+              : "Card, Apple Pay or Google Pay. Today’s charge is the starter fee. The monthly fee begins when the trial ends."}
+          </p>
+
+          {false && sipayConfigQ.data?.key && (
             <div className="flex flex-col items-stretch gap-3">
               <p className="text-[11px] font-bold tracking-wide uppercase text-slate-500 -mb-0.5">{t.paywall_choose_method}</p>
               {/* Apple Pay button — only shown on Safari iOS/macOS where the
@@ -693,7 +742,7 @@ function SipayCheckoutForm({
                   confirmation. */}
               {GPAY_ENABLED && (
                 <GooglePayButton
-                  sipayMerchantKey={sipayConfigQ.data.key}
+                  sipayMerchantKey={sipayConfigQ.data?.key ?? ""}
                   amountCents={introCents}
                   onSuccess={(txn) => {
                     window.location.href = `/payment/success?txn=${encodeURIComponent(txn)}&provider=sipay-gpay`;
@@ -822,7 +871,7 @@ function SipayCheckoutForm({
                 )}
               <button
                 type="button"
-                data-key={sipayConfigQ.data.key}
+                data-key={sipayConfigQ.data?.key ?? ""}
                 data-amount="50"
                 data-currency="EUR"
                 data-template="v4"
@@ -957,8 +1006,8 @@ function SipayCheckoutForm({
 
           {/* Compact trust badges — kept slim, no border */}
           <div className="flex items-center justify-center gap-3 text-[10px] text-gray-400 flex-wrap">
-            <span className="flex items-center gap-1"><Shield className="w-2.5 h-2.5" /> {s.trust3ds}</span>
-            <span className="flex items-center gap-1"><Lock className="w-2.5 h-2.5" /> {s.trustPci}</span>
+            <span className="flex items-center gap-1"><Shield className="w-2.5 h-2.5" /> 3D Secure</span>
+            <span className="flex items-center gap-1"><Lock className="w-2.5 h-2.5" /> Stripe</span>
           </div>
 
           {/* Mobile-only: compact Trustpilot strip at the bottom of the

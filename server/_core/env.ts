@@ -15,6 +15,12 @@ export const ENV = {
   cronSecret: process.env.CRON_SECRET ?? "",
   googleClientId: process.env.GOOGLE_CLIENT_ID ?? "",
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
+  // Stripe. The secret and the webhook signing secret stay in the host env.
+  // Price IDs are filled after the products are created; env overrides them.
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
+  stripePriceId: process.env.STRIPE_PRICE_ID ?? "price_1UWESFEn0nNnfagpkHQIPXhw",
+  stripeIntroPriceId: process.env.STRIPE_INTRO_PRICE_ID ?? "price_1UWESFEn0nNnfagp1rqEMPnd",
   // Cloudflare R2 storage
   r2AccountId: process.env.R2_ACCOUNT_ID ?? process.env.CF_R2_ACCOUNT_ID ?? "",
   r2AccessKeyId: process.env.R2_ACCESS_KEY_ID ?? process.env.CF_R2_ACCESS_KEY_ID ?? "",

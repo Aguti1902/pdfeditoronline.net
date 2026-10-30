@@ -313,7 +313,7 @@ export type InsertWebhookEvent = typeof webhookEvents.$inferInsert;
 export const charges = mysqlTable("charges", {
   id: int("id").autoincrement().primaryKey(),
   userId: int("userId").notNull(),
-  provider: mysqlEnum("provider", ["fastpay", "gpay", "apay", "mit"]).notNull(),
+  provider: mysqlEnum("provider", ["fastpay", "gpay", "apay", "mit", "stripe"]).notNull(),
   amountCents: int("amountCents").notNull(),
   refundedCents: int("refundedCents").default(0).notNull(),
   currency: varchar("currency", { length: 8 }).default("EUR").notNull(),

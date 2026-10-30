@@ -1375,7 +1375,7 @@ export async function recordPaymentAttempt(opts: {
 
 export async function recordCharge(opts: {
   userId: number;
-  provider: "fastpay" | "gpay" | "apay" | "mit";
+  provider: "fastpay" | "gpay" | "apay" | "mit" | "stripe";
   amountCents: number;
   sipayTransactionId?: string;
   sipayOrder?: string;
@@ -2299,6 +2299,27 @@ export async function upgradeTrialImmediately(userId: number) {
   const sub = await getActiveSubscription(userId);
   if (!sub) return { success: false as const, error: "No active subscription", code: "NO_SUB" as const };
   if (sub.plan !== "trial") return { success: false as const, error: "Not on trial", code: "NOT_TRIAL" as const };
+  if (sub.sipayTransactionId?.startsWith("sub_")) {
+    try {
+      const { endStripeTrialNow } = await import("./_core/stripeBilling");
+      await endStripeTrialNow(sub.sipayTransactionId);
+      const newStart = new Date();
+      const newEnd = new Date(newStart.getTime() + 30 * 24 * 60 * 60 * 1000);
+      const database = await getDb();
+      if (database) {
+        await database.update(subscriptions).set({
+          plan: "monthly",
+          status: "active",
+          currentPeriodStart: newStart,
+          currentPeriodEnd: newEnd,
+        }).where(eq(subscriptions.id, sub.id));
+      }
+      const price = await getActiveMonthlyPrice();
+      return { success: true as const, chargedAmountEur: price.eur };
+    } catch (err: any) {
+      return { success: false as const, error: err?.message ?? String(err), code: "SIPAY_ERROR" as const };
+    }
+  }
   if (!sub.sipayToken) return { success: false as const, error: "Sipay token missing", code: "NO_TOKEN" as const };
 
   const { createMITRecurring } = await import("./_core/sipay");
@@ -2412,6 +2433,23 @@ export async function webhookEventExists(eventId: string): Promise<boolean> {
   const rows = await db.select({ id: webhookEvents.id }).from(webhookEvents)
     .where(eq(webhookEvents.eventId, eventId)).limit(1);
   return rows.length > 0;
+}
+
+export async function hasWebhookEventId(eventId: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db || !eventId) return false;
+  const rows = await db.select({ id: webhookEvents.id }).from(webhookEvents)
+    .where(and(eq(webhookEvents.eventId, eventId), eq(webhookEvents.status, "ok"))).limit(1);
+  return rows.length > 0;
+}
+
+/** Local subscription row whose gateway id is a Stripe `sub_…`. */
+export async function getSubscriptionByStripeId(stripeSubscriptionId: string) {
+  const db = await getDb();
+  if (!db || !stripeSubscriptionId) return null;
+  const rows = await db.select().from(subscriptions)
+    .where(eq(subscriptions.sipayTransactionId, stripeSubscriptionId)).limit(1);
+  return rows[0] ?? null;
 }
 
 export async function recordWebhookEvent(opts: {

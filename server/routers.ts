@@ -98,6 +98,27 @@ const adminProcedure = protectedProcedure.use(({ ctx, next }) => {
  * un proxy, así que `req.ip` sería la del proxy — inútil como prueba. Se lee la
  * cabecera de Cloudflare primero y se cae a la cadena de X-Forwarded-For.
  */
+const CHECKOUT_HOSTS = new Set([
+  "pdfeditoronline.net",
+  "www.pdfeditoronline.net",
+  "pdfeditoronlinenet.vercel.app",
+  "localhost",
+  "127.0.0.1",
+]);
+
+function safeCheckoutOrigin(raw: string): string {
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    const local = host === "localhost" || host === "127.0.0.1";
+    if (!CHECKOUT_HOSTS.has(host)) return "https://www.pdfeditoronline.net";
+    if (!local && url.protocol !== "https:") return "https://www.pdfeditoronline.net";
+    return url.origin;
+  } catch {
+    return "https://www.pdfeditoronline.net";
+  }
+}
+
 function clientIpOf(req: any): string {
   return String(
     req?.headers?.["cf-connecting-ip"]
@@ -419,9 +440,72 @@ export const appRouter = router({
     }),
 
     cancel: protectedProcedure.mutation(async ({ ctx }) => {
+      const sub = await getActiveSubscription(ctx.user.id);
+      const stripeSubId = sub?.sipayTransactionId ?? "";
+      if (stripeSubId.startsWith("sub_")) {
+        const { cancelStripeAtPeriodEnd } = await import("./_core/stripeBilling");
+        await cancelStripeAtPeriodEnd(stripeSubId);
+      }
       await cancelSubscriptionDb(ctx.user.id);
       return { success: true };
     }),
+
+    // Hosted Stripe Checkout: 0,50 € now, monthly price after the trial.
+    // The browser never sees the secret key. Renewals are Stripe's, not the Sipay cron.
+    stripeCheckout: protectedProcedure
+      .input(z.object({
+        lang: z.string().max(8).optional(),
+        gclid: z.string().max(512).optional(),
+        gclidType: z.string().max(16).optional(),
+        origin: z.string().max(200),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        const { openAltaGuard, recordAltaBlocked } = await import("./_core/altaGuard");
+        const guard = await openAltaGuard(ctx.user.id);
+        if (!guard.ok) {
+          await recordAltaBlocked({
+            userId: ctx.user.id, method: "fastpay", reason: guard.reason,
+            existingChargeId: guard.existing?.id,
+          });
+          if (guard.reason === "already_paid" && guard.existing) {
+            return {
+              url: null as string | null,
+              alreadyPaid: true,
+              txn: guard.existing.sipayOrder ?? guard.existing.sipayTransactionId ?? "",
+            };
+          }
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "Ya hay un pago en curso para esta cuenta. Espera unos segundos.",
+          });
+        }
+        try {
+          const { ENV } = await import("./_core/env");
+          if (!ENV.stripeSecretKey || !ENV.stripeIntroPriceId || !ENV.stripePriceId) {
+            throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Stripe no está configurado." });
+          }
+          const { getTrialHours, getActiveMonthlyPrice } = await import("./db");
+          const { createStripeCheckout } = await import("./_core/stripeBilling");
+          const trialHours = await getTrialHours();
+          const monthly = await getActiveMonthlyPrice();
+          const origin = safeCheckoutOrigin(input.origin);
+          const session = await createStripeCheckout({
+            userId: ctx.user.id,
+            email: ctx.user.email ?? "",
+            origin,
+            lang: input.lang,
+            trialHours,
+            introPriceId: ENV.stripeIntroPriceId,
+            monthlyPriceId: ENV.stripePriceId,
+            recurringCents: Math.round(monthly.eur * 100),
+            gclid: input.gclid,
+            gclidType: input.gclidType,
+          });
+          return { url: session.url, alreadyPaid: false, txn: session.id };
+        } finally {
+          guard.release();
+        }
+      }),
 
     // ── Trial usage gate ────────────────────────────────────
     trialUsage: protectedProcedure.query(async ({ ctx }) => {

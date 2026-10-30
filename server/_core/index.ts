@@ -143,6 +143,24 @@ async function startServer() {
     res.status(204).end();
   });
 
+  // Stripe signs the raw body. This route must run before express.json()
+  // parses it, or the signature check fails on every delivery.
+  app.post(
+    "/api/stripe/webhook",
+    express.raw({ type: "application/json" }),
+    async (req, res) => {
+      try {
+        const { handleStripeWebhook } = await import("./stripeBilling");
+        const sig = req.headers["stripe-signature"];
+        await handleStripeWebhook(req.body, typeof sig === "string" ? sig : "");
+        res.json({ received: true });
+      } catch (err: any) {
+        console.error("[Stripe webhook]", err?.message ?? err);
+        res.status(400).send("Webhook error");
+      }
+    },
+  );
+
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
